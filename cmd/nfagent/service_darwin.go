@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"time"
 )
 
 const serviceUnit = "/Library/LaunchDaemons/cc.netflow.agent.plist"
@@ -48,10 +49,37 @@ func writeService(binary string) error {
 	if err := os.WriteFile(serviceUnit, []byte(plist), 0o644); err != nil {
 		return fmt.Errorf("writing %s: %w", serviceUnit, err)
 	}
-	// Unloaded first because launchctl refuses to load a label that is already
-	// there, and reinstalling over an older version is the common case.
+
+	// Reinstalling over a running daemon is the common case, not the unusual
+	// one, and it is the case this used to get wrong: bootout was issued and
+	// bootstrap followed immediately, into a label launchd had not finished
+	// tearing down yet. It answers that with "Bootstrap failed: 5: Input/output
+	// error", which says nothing about what happened and is what an upgrade
+	// looked like from the outside.
+	//
+	// So: if the daemon is loaded, restart it in place. The plist is the same
+	// file with the same program in it — only the binary underneath it changed,
+	// and kickstart is the operation for exactly that.
+	if loaded() {
+		return sh("launchctl", "kickstart", "-k", "system/"+serviceName)
+	}
+
 	_ = exec.Command("launchctl", "bootout", "system/"+serviceName).Run()
+	// And when it does have to be booted out — a first install after a failed
+	// one, a plist written by an older version — wait for the label to actually
+	// go before asking for it back.
+	for range 50 {
+		if !loaded() {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 	return sh("launchctl", "bootstrap", "system", serviceUnit)
+}
+
+// loaded says whether launchd currently has the daemon.
+func loaded() bool {
+	return exec.Command("launchctl", "print", "system/"+serviceName).Run() == nil
 }
 
 func removeService() error {

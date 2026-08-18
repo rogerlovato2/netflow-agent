@@ -14,7 +14,7 @@ package selfupdate
 // `nfsign keygen`, paste the public half here, and keep the private half as the
 // NFSIGN_KEY secret of the repository — it must never be on the panel, on the
 // server, or on any machine in the mesh.
-const PublicKey = ""
+const PublicKey = "28CUsS0+1/x/oucs0nCLWdeEBDIlzdMBU8noinDsJHE="
 
 // repo is where releases come from, and it is not configurable either.
 //
