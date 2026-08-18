@@ -102,8 +102,24 @@ func collectReport(eng *engine.Engine) ([]peerReport, error) {
 	return out, nil
 }
 
+// machineFacts is what only this machine knows: which build is running, what
+// it is running on, and what it calls itself.
+//
+// Sent with every report rather than once at enrolment, because all three
+// change without the machine rejoining — an upgrade, a distribution upgrade, a
+// rename — and a panel showing the value from the day it joined would be
+// confidently wrong.
+func machineFacts() map[string]string {
+	host, _ := os.Hostname()
+	return map[string]string{
+		"version":  version,
+		"system":   systemName(),
+		"hostname": host,
+	}
+}
+
 func postReport(ctx context.Context, cfg *Config, rows []peerReport) error {
-	body, err := json.Marshal(map[string]any{"peers": rows})
+	body, err := json.Marshal(map[string]any{"peers": rows, "machine": machineFacts()})
 	if err != nil {
 		return err
 	}
