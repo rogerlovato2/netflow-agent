@@ -64,7 +64,14 @@ func base() string {
 	return "https://github.com/" + repo + "/releases"
 }
 
+// noKey is the tests asking what a build with no key does — which was the
+// state of this package before one existed, and has to keep failing closed.
+var noKey bool
+
 func trustedKey() string {
+	if noKey {
+		return ""
+	}
 	if testKey != "" {
 		return testKey
 	}

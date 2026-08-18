@@ -192,15 +192,38 @@ func TestOlderReleasesAreRefused(t *testing.T) {
 	}
 }
 
-// A build with no key installs nothing, whatever it is offered. This is the
-// default state of the source, and it has to fail closed.
+// A build with no key installs nothing, whatever it is offered.
+//
+// This was the default state of the source until a key was generated, and it
+// has to stay true: a build made from a branch with no key, or one where it was
+// removed, must fail closed rather than accept anything.
 func TestNoKeyMeansNoUpdates(t *testing.T) {
-	if Enabled() {
-		t.Fatal("this build trusts a key it was not given")
+	// The real constant is emptied for the length of this test, because the
+	// question is about a build without one.
+	saved := PublicKey
+	testKey = ""
+	defer func() { testKey = saved }()
+
+	if err := withoutKey(func() error {
+		if Enabled() {
+			return errors.New("a build with no key says it can update")
+		}
+		_, err := Apply(context.Background(), "v9.9.9", "v0.1.0", quiet())
+		if !errors.Is(err, ErrNoKey) {
+			return fmt.Errorf("error is %v, want ErrNoKey", err)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
 	}
-	if _, err := Apply(context.Background(), "v9.9.9", "v0.1.0", quiet()); !errors.Is(err, ErrNoKey) {
-		t.Fatalf("error is %v, want ErrNoKey", err)
-	}
+}
+
+// withoutKey runs f as though this build had never been given a key.
+func withoutKey(f func() error) error {
+	saved := noKey
+	noKey = true
+	defer func() { noKey = saved }()
+	return f()
 }
 
 func TestVersionOrder(t *testing.T) {
