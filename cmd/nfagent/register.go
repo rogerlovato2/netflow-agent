@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/rogerlovato2/netflow-agent/internal/engine"
@@ -115,6 +116,9 @@ func machineFacts() map[string]string {
 		"version":  version,
 		"system":   systemName(),
 		"hostname": host,
+		// Empty when the last attempt was fine, which is also what a machine
+		// that has never tried reports.
+		"updateError": updateError(),
 	}
 }
 
@@ -240,6 +244,40 @@ type networkMap struct {
 	// consumed as an event: an agent that was offline while it changed still
 	// sees it when it returns.
 	Generation int64 `json:"generation"`
+	// Update is what the panel says about replacing this binary. The server
+	// can ask; it cannot say where the binary comes from, and it cannot make an
+	// unsigned one acceptable. Absent means no.
+	Update *updatePolicy `json:"update,omitempty"`
+}
+
+// updatePolicy is the whole of what the server is allowed to decide.
+type updatePolicy struct {
+	Enabled bool `json:"enabled"`
+	// Version is a tag, or empty for the newest release. It cannot be a URL,
+	// and there is nowhere in this struct to put one.
+	Version string `json:"version,omitempty"`
+}
+
+// lastPolicy is what the most recent map said about updates, for the periodic
+// check to read. The map is polled every twenty seconds and the check runs
+// every six hours; without this the check would have to ask the server itself,
+// which is a second way for the same answer to arrive and disagree.
+var lastPolicy struct {
+	sync.Mutex
+	value *updatePolicy
+}
+
+func setPolicy(p *updatePolicy) {
+	lastPolicy.Lock()
+	defer lastPolicy.Unlock()
+	lastPolicy.value = p
+}
+
+// UpdatePolicy is what the server last asked for.
+func UpdatePolicy() *updatePolicy {
+	lastPolicy.Lock()
+	defer lastPolicy.Unlock()
+	return lastPolicy.value
 }
 
 // followTheMap keeps the engine's peer list in step with the server's.
@@ -288,6 +326,8 @@ func followTheMap(ctx context.Context, eng *engine.Engine, cfg *Config, path str
 					}
 				}
 			}
+
+			setPolicy(m.Update)
 
 			// Two things the server can change about this machine that it
 			// cannot adopt in place.

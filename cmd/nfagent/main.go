@@ -129,6 +129,15 @@ type Config struct {
 	// Generation is the last reconnect request this machine acted on. Kept in
 	// the file so a restart does not act on the same one again.
 	Generation int64 `json:"generation,omitempty"`
+	// NoRemoteUpdate refuses to replace this machine's binary, whatever the
+	// server says.
+	//
+	// The switch in the panel is policy: it decides what the fleet does, and
+	// whoever holds the panel can turn it back on. This one is on the machine
+	// and nothing on the network can reach it — it is for the machine that must
+	// never change under you, and it is why the flag exists separately from the
+	// setting rather than as a mirror of it.
+	NoRemoteUpdate bool `json:"noRemoteUpdate,omitempty"`
 }
 
 // RelayConfig is a relay and a credential for it, both issued by the server.
@@ -267,6 +276,9 @@ func up(args []string) error {
 		go runProbe(ctx, eng, *probe, log)
 	}
 	go reportStatus(ctx, eng, peers, log)
+	// The map carries the policy and is polled often; this is only what makes a
+	// machine left alone for a long time eventually catch up.
+	go watchForUpdates(ctx, eng, cfg, UpdatePolicy, log)
 	go serveControl(ctx, eng, cfg, log)
 
 	<-ctx.Done()

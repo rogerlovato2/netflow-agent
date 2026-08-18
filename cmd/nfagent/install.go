@@ -27,6 +27,8 @@ func install(args []string) error {
 	server := fs.String("server", "", "the management server")
 	name := fs.String("name", "", "what to call this machine")
 	path := fs.String("config", defaultConfigPath(), "where the identity is kept")
+	noUpdate := fs.Bool("no-remote-update", false,
+		"never replace this machine's binary, whatever the panel says")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -47,6 +49,15 @@ func install(args []string) error {
 		}
 	} else {
 		fmt.Printf("already a member as %s\n", cfg.Address)
+	}
+
+	// Written whether or not it was asked for, so that turning it off later is
+	// the same operation as turning it on.
+	if cfg.NoRemoteUpdate != *noUpdate {
+		cfg.NoRemoteUpdate = *noUpdate
+		if err := saveConfig(*path, cfg); err != nil {
+			return fmt.Errorf("saving the update setting: %w", err)
+		}
 	}
 
 	binary, err := copySelf()

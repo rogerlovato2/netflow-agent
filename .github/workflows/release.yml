@@ -49,6 +49,26 @@ jobs:
           done
           cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS
 
+      # The signature over SHA256SUMS is what an agent checks before it replaces
+      # itself, and every binary's digest is in that one file — so one signature
+      # covers the release and there is no way to pair an old binary with a new
+      # list.
+      #
+      # A missing key does not fail the build. It produces an unsigned release,
+      # which agents refuse to install: safe, loud in the log, and installable
+      # by hand. Failing here instead would mean a broken release pipeline the
+      # first time somebody rotates the secret.
+      - name: Sign the checksums
+        env:
+          NFSIGN_KEY: ${{ secrets.NFSIGN_KEY }}
+        run: |
+          if [ -z "${NFSIGN_KEY:-}" ]; then
+            echo "::warning::NFSIGN_KEY is not set — this release is UNSIGNED and no agent will install it automatically"
+            exit 0
+          fi
+          go run ./cmd/nfsign sign dist/SHA256SUMS
+          ls -la dist/SHA256SUMS.sig
+
       # The menu bar client is built on the machine it runs on, not cross
       # compiled. systray needs cgo and the platform's own toolkit — Cocoa here,
       # GTK on Linux — and a cross build silently produces something that links
