@@ -236,6 +236,7 @@ func enrol(server, setupKey, name, out string) (*Config, error) {
 // networkMap is what the server answers.
 type networkMap struct {
 	Address   string       `json:"address"`
+	Subnet    string       `json:"subnet,omitempty"`
 	SignalURL string       `json:"signalUrl"`
 	Relay     *RelayConfig `json:"relay,omitempty"`
 	Peers     []PeerConfig `json:"peers"`
@@ -340,6 +341,19 @@ func followTheMap(ctx context.Context, eng *engine.Engine, cfg *Config, path str
 			// stop, and let the service manager start again. A process that
 			// tried to rebuild itself in place would be reimplementing what the
 			// service manager already does correctly.
+			// The subnet is written into the routing table when the interface
+			// comes up, so a change to it is the same kind of change as the
+			// address: not adoptable in place.
+			if m.Subnet != "" && m.Subnet != cfg.Subnet {
+				log.Info("the server changed the mesh subnet; restarting",
+					"from", cfg.Subnet, "to", m.Subnet)
+				cfg.Subnet = m.Subnet
+				if err := saveConfig(path, cfg); err != nil {
+					log.Warn("could not save the new subnet", "err", err)
+				}
+				restart(eng)
+				return
+			}
 			if m.Address != "" && m.Address != cfg.Address {
 				log.Info("the server moved this machine; restarting",
 					"from", cfg.Address, "to", m.Address)

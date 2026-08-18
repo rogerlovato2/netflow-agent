@@ -110,6 +110,25 @@ type Config struct {
 	// TUNName is the interface to create. Empty takes the default, and macOS
 	// ignores it entirely because the kernel names utun devices itself.
 	TUNName string
+
+	// Subnet is the whole mesh, routed into the interface with a single entry.
+	//
+	// The alternative — and what this did at first — is one route per peer.
+	// Both deliver the same packets, and the difference shows up as the mesh
+	// grows: five hundred machines meant five hundred routes, rewritten every
+	// time the map changed, to express one fact that never changes. The kernel
+	// does not mind, but every one of those writes is a chance to leave a stale
+	// route behind pointing at where a machine used to be.
+	//
+	// It changes nothing about what may travel. WireGuard's allowed IPs are
+	// still per peer and still the access control: a packet for a mesh address
+	// with no peer to match enters the interface and is dropped there, which is
+	// what should happen to it. Without the route it would go to the default
+	// gateway instead — a mesh address loose on the local network, which is
+	// both wrong and quiet about it.
+	//
+	// Zero falls back to a route per peer, for a server too old to send this.
+	Subnet netip.Prefix
 	// P2P configures candidate gathering. Its PrivateKey is filled in from the
 	// one above, so there is only ever one key to get right.
 	P2P p2p.Config
@@ -182,6 +201,16 @@ func New(cfg Config, log *slog.Logger) (*Engine, error) {
 	if err := dev.Up(); err != nil {
 		_ = dev.Close()
 		return nil, err
+	}
+	// One route for the whole mesh, added once and never touched again.
+	if cfg.Subnet.IsValid() {
+		if err := dev.AddRoute(cfg.Subnet); err != nil {
+			// Not fatal: the tunnels still form and carry traffic between the
+			// addresses the interface itself holds. What is lost is everything
+			// else in the mesh, so it is said loudly.
+			log.Error("engine: could not route the mesh into the interface",
+				"subnet", cfg.Subnet, "err", err)
+		}
 	}
 
 	return &Engine{
@@ -264,11 +293,12 @@ func (e *Engine) SetPeers(ctx context.Context, peers []Peer) {
 		e.peers[key] = link
 		starting = append(starting, link)
 
-		// The route goes in with the peer and not when it connects. Until the
-		// tunnel is up the packet enters the interface and is dropped there,
-		// which is what should happen; without the route it would go to the
-		// default gateway, and a mesh address on the local network is both
-		// wrong and quiet about it.
+		// A route per peer, only when there is no route for the whole mesh.
+		// With one, these would be five hundred more specific entries saying
+		// what the one already says.
+		if !e.routesPerPeer() {
+			continue
+		}
 		for _, a := range spec.AllowedIPs {
 			if rerr := e.dev.AddRoute(a); rerr != nil {
 				e.log.Warn("engine: could not route to a peer",
@@ -304,23 +334,8 @@ type readdressing struct{ prev, next Peer }
 // a failure: whenever it does connect it is configured from the spec, which is
 // already the new one.
 func (e *Engine) readdress(prev, next Peer) {
-	for _, a := range prev.AllowedIPs {
-		if containsPrefix(next.AllowedIPs, a) {
-			continue
-		}
-		if err := e.dev.DelRoute(a); err != nil {
-			e.log.Debug("engine: could not drop an old route",
-				"peer", short(next.PublicKey), "prefix", a, "err", err)
-		}
-	}
-	for _, a := range next.AllowedIPs {
-		if containsPrefix(prev.AllowedIPs, a) {
-			continue
-		}
-		if err := e.dev.AddRoute(a); err != nil {
-			e.log.Warn("engine: could not route to a peer's new address",
-				"peer", short(next.PublicKey), "prefix", a, "err", err)
-		}
+	if e.routesPerPeer() {
+		e.rerouteAllowedIPs(prev, next)
 	}
 
 	ep, known := e.dev.PeerEndpoint(next.PublicKey)
@@ -340,6 +355,31 @@ func (e *Engine) readdress(prev, next Peer) {
 	}
 	e.log.Info("engine: peer moved",
 		"peer", short(next.PublicKey), "from", prev.AllowedIPs, "to", next.AllowedIPs)
+}
+
+// routesPerPeer is false when one route covers the whole mesh.
+func (e *Engine) routesPerPeer() bool { return !e.cfg.Subnet.IsValid() }
+
+func (e *Engine) rerouteAllowedIPs(prev, next Peer) {
+	for _, a := range prev.AllowedIPs {
+		if containsPrefix(next.AllowedIPs, a) {
+			continue
+		}
+		if err := e.dev.DelRoute(a); err != nil {
+			e.log.Debug("engine: could not drop an old route",
+				"peer", short(next.PublicKey), "prefix", a, "err", err)
+		}
+	}
+	for _, a := range next.AllowedIPs {
+		if containsPrefix(prev.AllowedIPs, a) {
+			continue
+		}
+		if err := e.dev.AddRoute(a); err != nil {
+			e.log.Warn("engine: could not route to a peer's new address",
+				"peer", short(next.PublicKey), "prefix", a, "err", err)
+		}
+	}
+
 }
 
 func samePrefixes(a, b []netip.Prefix) bool {
@@ -658,10 +698,12 @@ func (e *Engine) retire(link *peerLink, key string) {
 	spec := link.spec
 	link.mu.Unlock()
 
-	for _, a := range spec.AllowedIPs {
-		if rerr := e.dev.DelRoute(a); rerr != nil {
-			e.log.Debug("engine: could not remove a peer's route",
-				"peer", short(spec.PublicKey), "prefix", a, "err", rerr)
+	if e.routesPerPeer() {
+		for _, a := range spec.AllowedIPs {
+			if rerr := e.dev.DelRoute(a); rerr != nil {
+				e.log.Debug("engine: could not remove a peer's route",
+					"peer", short(spec.PublicKey), "prefix", a, "err", rerr)
+			}
 		}
 	}
 	if err := e.dev.RemovePeer(spec.PublicKey); err != nil {

@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http/httptest"
@@ -91,6 +92,23 @@ func newMachineWithKey(
 	t *testing.T, ctx context.Context, signalURL, addr string, priv wgtypes.Key,
 ) *machine {
 	t.Helper()
+	return build(t, ctx, signalURL, addr, priv, netip.Prefix{})
+}
+
+// newMachineOn is a machine that was told what the whole mesh is, and so routes
+// it with one entry.
+func newMachineOn(
+	t *testing.T, ctx context.Context, signalURL, addr string, subnet netip.Prefix,
+) *machine {
+	t.Helper()
+	return build(t, ctx, signalURL, addr, genKey(t), subnet)
+}
+
+func build(
+	t *testing.T, ctx context.Context, signalURL, addr string,
+	priv wgtypes.Key, subnet netip.Prefix,
+) *machine {
+	t.Helper()
 
 	ctx, stop := context.WithCancel(ctx)
 	ip := netip.MustParseAddr(addr)
@@ -98,6 +116,7 @@ func newMachineWithKey(
 	eng, err := New(Config{
 		PrivateKey: priv,
 		Addresses:  []netip.Addr{ip},
+		Subnet:     subnet,
 		SignalURL:  signalURL,
 		Userspace:  true,
 		// Loopback only, and no STUN: the test proves the plumbing, and
@@ -472,4 +491,42 @@ func TestAPeerThatSaysGoodbyeIsBelievedAndMet(t *testing.T) {
 	waitUntil(t, "the path back", 20*time.Second, func() bool {
 		return a.eng.PeerState(back.pub) == p2p.StateConnected
 	})
+}
+
+// One route for the whole mesh, not one per machine in it.
+//
+// Five hundred peers meant five hundred routes, rewritten on every map change,
+// to express one fact that never changes. What may travel is not affected —
+// that is WireGuard's allowed IPs, which stay per peer either way, and
+// TestAPeerThatMovesIsFollowed is where that is checked against a real device.
+func TestOneRouteForTheWholeMesh(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	url := signalServer(t)
+
+	// A machine whose server never told it the subnet keeps the old behaviour.
+	// Being wrong in this direction is the safe one: a route too many delivers
+	// packets, a route too few does not.
+	old := newMachine(t, ctx, url, "10.27.0.1")
+	if !old.eng.routesPerPeer() {
+		t.Error("a machine with no subnet stopped routing per peer")
+	}
+
+	told := newMachineOn(t, ctx, url, "10.28.0.1", netip.MustParsePrefix("10.28.0.0/16"))
+	if told.eng.routesPerPeer() {
+		t.Error("a machine told the whole subnet is still routing per peer")
+	}
+
+	// Adding peers changes nothing about that, which is the point: the routing
+	// table stops being a function of the peer list.
+	for i := range 3 {
+		told.eng.SetPeers(ctx, []Peer{{
+			PublicKey:  genKey(t).PublicKey(),
+			AllowedIPs: []netip.Prefix{netip.MustParsePrefix(fmt.Sprintf("10.28.0.%d/32", i+2))},
+		}})
+		if told.eng.routesPerPeer() {
+			t.Fatalf("routing per peer came back after %d peers", i+1)
+		}
+	}
 }

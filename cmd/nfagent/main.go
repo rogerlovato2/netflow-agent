@@ -118,14 +118,18 @@ func printKey() error {
 // answer. Without them the file is the whole truth, which is what makes the
 // mesh testable before there is a server to ask.
 type Config struct {
-	PrivateKey string       `json:"privateKey"`
-	Address    string       `json:"address"`
-	SignalURL  string       `json:"signalUrl"`
-	Server     string       `json:"server,omitempty"`
-	Token      string       `json:"token,omitempty"`
-	STUN       []string     `json:"stun,omitempty"`
-	Relay      *RelayConfig `json:"relay,omitempty"`
-	Peers      []PeerConfig `json:"peers"`
+	PrivateKey string `json:"privateKey"`
+	Address    string `json:"address"`
+	// Subnet is the whole mesh, routed into the interface with one entry
+	// instead of one per peer. Empty means a server too old to say, and the
+	// agent falls back to a route per peer.
+	Subnet    string       `json:"subnet,omitempty"`
+	SignalURL string       `json:"signalUrl"`
+	Server    string       `json:"server,omitempty"`
+	Token     string       `json:"token,omitempty"`
+	STUN      []string     `json:"stun,omitempty"`
+	Relay     *RelayConfig `json:"relay,omitempty"`
+	Peers     []PeerConfig `json:"peers"`
 	// Generation is the last reconnect request this machine acted on. Kept in
 	// the file so a restart does not act on the same one again.
 	Generation int64 `json:"generation,omitempty"`
@@ -215,9 +219,24 @@ func up(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// One route for the whole mesh rather than one per peer. A machine that
+	// joined before the server said what the subnet is keeps the old behaviour
+	// until its next map, which is the only safe way to be wrong here: a route
+	// too many delivers packets, a route too few does not.
+	var subnet netip.Prefix
+	if cfg.Subnet != "" {
+		if p, perr := netip.ParsePrefix(cfg.Subnet); perr == nil {
+			subnet = p
+		} else {
+			log.Warn("the mesh subnet does not parse; routing per peer instead",
+				"subnet", cfg.Subnet, "err", perr)
+		}
+	}
+
 	eng, err := engine.New(engine.Config{
 		PrivateKey: priv,
 		Addresses:  []netip.Addr{addr},
+		Subnet:     subnet,
 		SignalURL:  cfg.SignalURL,
 		Userspace:  *userspace,
 		TUNName:    *iface,
