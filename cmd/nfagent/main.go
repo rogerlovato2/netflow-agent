@@ -227,8 +227,16 @@ func up(args []string) error {
 		"signal", cfg.SignalURL, "peers", len(peers),
 		"publicKey", priv.PublicKey().String())
 
+	// The engine gets its own context so that shutting down has two steps in a
+	// definite order: say goodbye to the peers while the signal connection is
+	// still up, and only then stop the engine that owns it. Handing it ctx
+	// directly would tear the connection down at the same instant the message
+	// needed to leave on it.
+	engCtx, stopEngine := context.WithCancel(context.Background())
+	defer stopEngine()
+
 	done := make(chan error, 1)
-	go func() { done <- eng.Run(ctx) }()
+	go func() { done <- eng.Run(engCtx) }()
 
 	// The peers in the file are applied first, always, before anything is asked
 	// of the management server.
@@ -263,6 +271,8 @@ func up(args []string) error {
 
 	<-ctx.Done()
 	log.Info("shutting down")
+	eng.Goodbye()
+	stopEngine()
 	select {
 	case err := <-done:
 		return err

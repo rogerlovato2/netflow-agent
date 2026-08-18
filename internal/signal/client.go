@@ -67,7 +67,7 @@ type Client struct {
 	pub  wgtypes.Key
 	log  *slog.Logger
 
-	out chan Envelope
+	out chan outbound
 
 	// pingEvery and pingWait are fields rather than constants only so tests can
 	// shorten them: a dead path is otherwise a twenty-second wait to reproduce.
@@ -85,7 +85,7 @@ func NewClient(url string, priv wgtypes.Key, log *slog.Logger) *Client {
 		priv:      priv,
 		pub:       priv.PublicKey(),
 		log:       log,
-		out:       make(chan Envelope, outQueue),
+		out:       make(chan outbound, outQueue),
 		pingEvery: clientPingEvery,
 		pingWait:  pingWait,
 	}
@@ -116,13 +116,54 @@ func (c *Client) Send(to wgtypes.Key, kind Kind, b Body) error {
 	if err != nil {
 		return err
 	}
-	e := Envelope{Kind: kind, From: c.pub.String(), To: to.String(), Body: sealed}
+	return c.queue(outbound{env: c.envelope(to, kind, sealed)})
+}
+
+// SendNow is Send, but it waits until the writer has put the message on the
+// socket or the wait runs out.
+//
+// It exists for the last message a process sends. Send hands the envelope to a
+// queue and returns; a process that exits, or a context that is cancelled, in
+// the moment between those two things sends nothing at all — and the one
+// message where that matters is the one announcing that this machine is going
+// away.
+func (c *Client) SendNow(to wgtypes.Key, kind Kind, b Body, wait time.Duration) error {
+	sealed, err := Seal(b, c.priv, to)
+	if err != nil {
+		return err
+	}
+	written := make(chan struct{})
+	if err := c.queue(outbound{env: c.envelope(to, kind, sealed), written: written}); err != nil {
+		return err
+	}
 	select {
-	case c.out <- e:
+	case <-written:
+		return nil
+	case <-time.After(wait):
+		return errors.New("signal: the message did not reach the socket in time")
+	}
+}
+
+func (c *Client) envelope(to wgtypes.Key, kind Kind, sealed []byte) Envelope {
+	return Envelope{Kind: kind, From: c.pub.String(), To: to.String(), Body: sealed}
+}
+
+func (c *Client) queue(o outbound) error {
+	select {
+	case c.out <- o:
 		return nil
 	default:
 		return errors.New("signal: outbound queue is full")
 	}
+}
+
+// outbound is an envelope on its way out, and optionally somebody waiting to
+// hear that it left.
+type outbound struct {
+	env Envelope
+	// written is closed once the writer has handed the bytes to the socket, or
+	// given up on them. Nil when nobody is waiting, which is almost always.
+	written chan struct{}
 }
 
 // Run keeps the client connected until ctx is done. It only returns on ctx.
@@ -198,15 +239,19 @@ func (c *Client) writeLoop(ctx context.Context, ws *websocket.Conn) error {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case e := <-c.out:
-			data, err := json.Marshal(e)
+		case o := <-c.out:
+			data, err := json.Marshal(o.env)
 			if err != nil {
 				c.log.Warn("signal: encoding envelope", "err", err)
+				closeIf(o.written)
 				continue
 			}
 			wctx, cancel := context.WithTimeout(ctx, writeWait)
 			err = ws.Write(wctx, websocket.MessageText, data)
 			cancel()
+			// Whoever is waiting is told either way: they are waiting to stop
+			// waiting, not to be promised delivery.
+			closeIf(o.written)
 			if err != nil {
 				// The envelope is lost with the socket. Requeuing it would
 				// deliver a candidate from a session the other side has already
@@ -298,4 +343,10 @@ func (c *Client) setUp(v bool) {
 // server comes back at the same millisecond and knocks it over again.
 func jitter(d time.Duration) time.Duration {
 	return d/2 + time.Duration(rand.Int64N(int64(d)))
+}
+
+func closeIf(ch chan struct{}) {
+	if ch != nil {
+		close(ch)
+	}
 }

@@ -71,6 +71,9 @@ const (
 	// unconditional. Its cost is one small packet every twenty-five seconds;
 	// its absence is a tunnel that works until it goes quiet for a minute.
 	keepaliveSeconds = 25
+
+	// goodbyeFlush is how long the way out waits for its last message.
+	goodbyeFlush = 300 * time.Millisecond
 )
 
 // Peer is a peer this machine should have a tunnel to.
@@ -361,6 +364,34 @@ func containsPrefix(list []netip.Prefix, p netip.Prefix) bool {
 		}
 	}
 	return false
+}
+
+// Goodbye tells every peer that this machine is going away.
+//
+// Without it, a machine that restarts leaves the others checking against an
+// agent that no longer exists until their negotiation times out — twenty-five
+// seconds of a tunnel that is already dead, and then a backoff on top. One
+// message costs nothing and turns that into the truth immediately.
+//
+// Best effort by design: this runs on the way out, and a peer that does not
+// hear it is in exactly the position it would have been in anyway.
+func (e *Engine) Goodbye() {
+	e.mu.Lock()
+	keys := make([]wgtypes.Key, 0, len(e.peers))
+	for _, link := range e.peers {
+		link.mu.Lock()
+		keys = append(keys, link.spec.PublicKey)
+		link.mu.Unlock()
+	}
+	e.mu.Unlock()
+
+	// SendNow rather than Send: the caller is on its way out, and a message
+	// still sitting in a queue when the process exits was never sent.
+	for _, k := range keys {
+		if err := e.sig.SendNow(k, signal.KindBye, signal.Body{}, goodbyeFlush); err != nil {
+			e.log.Debug("engine: could not say goodbye", "peer", short(k), "err", err)
+		}
+	}
 }
 
 // PeerState reports where a peer's negotiation stands.
@@ -716,8 +747,34 @@ func (e *Engine) dispatch(m signal.Message) {
 		if abandon != nil {
 			abandon()
 		}
+		// And meet it now rather than after a backoff. The peer offered this
+		// instant, so it is awake this instant; waiting is how two machines end
+		// up each retrying while the other is asleep. Without this the abandoned
+		// attempt was followed by whatever delay had accumulated — a minute, at
+		// the top — and the offer that would have been answered is long gone by
+		// then.
+		select {
+		case link.wake <- struct{}{}:
+		default:
+		}
 	case signal.KindCandidate:
 		sess.AddRemoteCandidate(m.Body.Candidate)
+	case signal.KindBye:
+		// The peer is going away on purpose — restarting, or being shut down.
+		// Its session is dead the moment it said so, and holding ours means
+		// checking against an agent that is gone until the attempt times out.
+		//
+		// Deliberately without waking the link: an immediate retry would be
+		// aimed at a machine that is on its way down. Idle is the right place
+		// to wait, because an idle link starts the moment the peer's first
+		// message arrives — which is exactly when it is worth starting.
+		e.log.Debug("engine: peer said goodbye", "peer", short(m.From))
+		link.mu.Lock()
+		leaving := link.attemptCancel
+		link.mu.Unlock()
+		if leaving != nil {
+			leaving()
+		}
 	case signal.KindOffline:
 		// Nothing to do beyond noting it. The negotiation will time out on its
 		// own and the retry loop is already the right response; tearing down

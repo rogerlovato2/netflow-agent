@@ -75,12 +75,24 @@ type machine struct {
 	pub  wgtypes.Key
 	addr netip.Addr
 	eng  *Engine
+	// stop ends this machine's engine without touching the others, which is
+	// what makes it possible to restart one of them mid-test.
+	stop context.CancelFunc
 }
 
 func newMachine(t *testing.T, ctx context.Context, signalURL, addr string) *machine {
 	t.Helper()
+	return newMachineWithKey(t, ctx, signalURL, addr, genKey(t))
+}
 
-	priv := genKey(t)
+// newMachineWithKey is the same machine coming back: same identity, same
+// address, a new process.
+func newMachineWithKey(
+	t *testing.T, ctx context.Context, signalURL, addr string, priv wgtypes.Key,
+) *machine {
+	t.Helper()
+
+	ctx, stop := context.WithCancel(ctx)
 	ip := netip.MustParseAddr(addr)
 
 	eng, err := New(Config{
@@ -104,7 +116,7 @@ func newMachine(t *testing.T, ctx context.Context, signalURL, addr string) *mach
 	}
 	go func() { _ = eng.Run(ctx) }()
 
-	return &machine{priv: priv, pub: priv.PublicKey(), addr: ip, eng: eng}
+	return &machine{priv: priv, pub: priv.PublicKey(), addr: ip, eng: eng, stop: stop}
 }
 
 // echoOnce answers one TCP connection inside the tunnel.
@@ -405,4 +417,59 @@ func TestReorderedAddressesAreNotAMove(t *testing.T) {
 	if samePrefixes([]netip.Prefix{x}, []netip.Prefix{y}) {
 		t.Error("a different address does not read as a move")
 	}
+}
+
+// A machine that goes away on purpose has to be believed, and met when it
+// returns.
+//
+// This is the failure it was written for. Changing a machine's address restarts
+// its agent; the peers were left holding a session against an agent that no
+// longer existed, and only found out when their own negotiation timed out —
+// twenty-five seconds, plus whatever backoff had built up. In the field two
+// machines took a minute and a half to line up an attempt, each one awake while
+// the other was waiting.
+func TestAPeerThatSaysGoodbyeIsBelievedAndMet(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	url := signalServer(t)
+	a := newMachine(t, ctx, url, "10.25.0.1")
+	b := newMachine(t, ctx, url, "10.25.0.2")
+
+	peersOfA := []Peer{{PublicKey: b.pub, AllowedIPs: []netip.Prefix{netip.PrefixFrom(b.addr, 32)}}}
+	peersOfB := []Peer{{PublicKey: a.pub, AllowedIPs: []netip.Prefix{netip.PrefixFrom(a.addr, 32)}}}
+
+	waitUntil(t, "both on the signal server", 20*time.Second, func() bool {
+		return a.eng.SignalConnected() && b.eng.SignalConnected()
+	})
+	a.eng.SetPeers(ctx, peersOfA)
+	b.eng.SetPeers(ctx, peersOfB)
+	waitUntil(t, "the first path", 60*time.Second, func() bool {
+		return a.eng.PeerState(b.pub) == p2p.StateConnected
+	})
+
+	// b goes away the way a real one does: it says so, then stops.
+	b.eng.Goodbye()
+	b.stop()
+
+	// The word is the whole point. Nothing else tells a that the peer is gone:
+	// ICE has no packet to miss on a path that simply stopped being used, so
+	// without the message this stays connected until something else forces the
+	// question — which in the field was tens of seconds of a tunnel that had
+	// already died.
+	waitUntil(t, "the peer to be given up", 5*time.Second, func() bool {
+		return a.eng.PeerState(b.pub) != p2p.StateConnected
+	})
+
+	// And the same machine comes back: same key, same address, new everything
+	// else.
+	back := newMachineWithKey(t, ctx, url, "10.25.0.2", b.priv)
+	waitUntil(t, "the returning machine on the signal server", 20*time.Second, func() bool {
+		return back.eng.SignalConnected()
+	})
+	back.eng.SetPeers(ctx, peersOfB)
+
+	waitUntil(t, "the path back", 20*time.Second, func() bool {
+		return a.eng.PeerState(back.pub) == p2p.StateConnected
+	})
 }

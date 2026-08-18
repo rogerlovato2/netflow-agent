@@ -288,10 +288,20 @@ func followTheMap(ctx context.Context, eng *engine.Engine, cfg *Config, path str
 				log.Info("the server moved this machine; restarting",
 					"from", cfg.Address, "to", m.Address)
 				cfg.Address = m.Address
+				// The generation from this same map is adopted here, not left
+				// for the next process to discover. Moving a machine bumps it,
+				// so a restart that carried only the address came back up, read
+				// the identical map, found a generation it had never recorded
+				// and restarted a second time — two service restarts and the
+				// delay between them for one change, while every peer sat
+				// negotiating with a machine that kept disappearing.
+				if m.Generation > cfg.Generation {
+					cfg.Generation = m.Generation
+				}
 				if err := saveConfig(path, cfg); err != nil {
 					log.Warn("could not save the new address", "err", err)
 				}
-				restart()
+				restart(eng)
 				return
 			}
 			if m.Generation > cfg.Generation {
@@ -301,7 +311,7 @@ func followTheMap(ctx context.Context, eng *engine.Engine, cfg *Config, path str
 				if err := saveConfig(path, cfg); err != nil {
 					log.Warn("could not save the generation", "err", err)
 				}
-				restart()
+				restart(eng)
 				return
 			}
 
@@ -396,7 +406,10 @@ func mapFingerprint(peers []PeerConfig) string {
 //
 // A machine running `nfagent up` by hand does not get restarted, and sees the
 // reason on the way out.
-func restart() {
+func restart(eng *engine.Engine) {
+	// Said before going, so the peers drop this machine now instead of checking
+	// against an agent that is already gone until their negotiation times out.
+	eng.Goodbye()
 	fmt.Fprintln(os.Stderr,
 		"restarting to apply a change from the server; the service manager will start it again")
 	os.Exit(1)
