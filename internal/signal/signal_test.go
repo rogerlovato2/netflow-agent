@@ -17,10 +17,14 @@ import (
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
 
-// waitFor is how long a test waits for something that crosses a socket. Local
-// loopback needs microseconds; the margin is for a loaded CI machine, and it is
-// only ever paid when a test is about to fail anyway.
-const waitFor = 3 * time.Second
+// waitFor is how long a test waits for something that crosses a socket.
+//
+// Local loopback needs microseconds and this is ten seconds, which looks absurd
+// until it is paid: a shared CI runner under -race took longer than three, and
+// the test that failed was asserting that a message arrives at all. The limit
+// exists to catch "never", not "slowly", so making it generous costs nothing —
+// it is only ever waited out when the test was going to fail anyway.
+const waitFor = 10 * time.Second
 
 func quietLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
