@@ -1,6 +1,7 @@
 package tunnel
 
 import (
+	"bytes"
 	"fmt"
 	"log/slog"
 	"net/netip"
@@ -45,10 +46,7 @@ func NewTUNDevice(name string, addrs []netip.Addr, mtu int, log *slog.Logger) (*
 
 	t, err := tun.CreateTUN(name, mtu)
 	if err != nil {
-		if os.Geteuid() != 0 {
-			return nil, fmt.Errorf("tunnel: creating the interface needs root: %w", err)
-		}
-		return nil, fmt.Errorf("tunnel: creating the interface: %w", err)
+		return nil, explainTUNFailure(err)
 	}
 
 	// What the kernel actually called it, which on macOS is never what was asked.
@@ -65,7 +63,54 @@ func NewTUNDevice(name string, addrs []netip.Addr, mtu int, log *slog.Logger) (*
 
 	d := device.NewDevice(t, conn.NewDefaultBind(), deviceLogger(log))
 	log.Info("tunnel: interface up", "name", real, "addrs", addrs, "mtu", mtu)
-	return &Device{dev: d, tun: t, name: real, log: log, peers: map[string]netip.AddrPort{}}, nil
+	return &Device{ctrl: userspaceControl{d}, dev: d, tun: t, name: real, log: log, peers: map[string]netip.AddrPort{}}, nil
+}
+
+// explainTUNFailure turns the kernel's answer into the thing to go and do.
+//
+// Three failures land here and each needs something different from whoever is
+// reading it: no privilege, no device node, or a name the system will not
+// accept. They arrived as one line of driver output that named the symptom and
+// not the cause, and the most common of them — a container that was never given
+// /dev/net/tun — cannot be fixed from inside the container at all, which is
+// exactly the case where a person needs to be told where to go.
+func explainTUNFailure(err error) error {
+	if os.Geteuid() != 0 {
+		return fmt.Errorf("tunnel: creating a network interface needs root; run this with sudo: %w", err)
+	}
+	if _, statErr := os.Stat("/dev/net/tun"); os.IsNotExist(statErr) {
+		if inContainer() {
+			return fmt.Errorf("tunnel: /dev/net/tun does not exist in this container, and cannot "+
+				"be created from inside it. The host has to pass the device through — on Proxmox, "+
+				"add to /etc/pve/lxc/<id>.conf:\n"+
+				"    lxc.cgroup2.devices.allow: c 10:200 rwm\n"+
+				"    lxc.mount.entry: /dev/net/tun dev/net/tun none bind,create=file\n"+
+				"and restart the container. On Docker, run with --device /dev/net/tun.\n"+
+				"Underlying error: %w", err)
+		}
+		return fmt.Errorf("tunnel: /dev/net/tun does not exist. The tun module is not loaded: "+
+			"try `modprobe tun`, and add it to /etc/modules-load.d so it survives a reboot.\n"+
+			"Underlying error: %w", err)
+	}
+	return fmt.Errorf("tunnel: creating the interface: %w", err)
+}
+
+// inContainer is a guess, and only ever used to choose which advice to print.
+// Being wrong prints the other paragraph, which is a bad hint rather than a bad
+// outcome — so the cheap checks are enough and there is no need for more.
+func inContainer() bool {
+	if _, err := os.Stat("/.dockerenv"); err == nil {
+		return true
+	}
+	if b, err := os.ReadFile("/proc/1/environ"); err == nil &&
+		bytes.Contains(b, []byte("container=")) {
+		return true
+	}
+	if b, err := os.ReadFile("/proc/1/cgroup"); err == nil &&
+		(bytes.Contains(b, []byte("/docker/")) || bytes.Contains(b, []byte("/lxc/"))) {
+		return true
+	}
+	return false
 }
 
 // AddRoute sends a prefix through this interface.

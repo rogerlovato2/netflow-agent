@@ -22,7 +22,24 @@ import (
 // the three platforms would need a different implementation anyway. One code
 // path costs roughly fifteen percent of throughput and buys a single set of
 // bugs to fix.
+// wgControl is the half of a device that differs between the kernel's
+// WireGuard and the one in this process.
+//
+// Everything else — the interface, its address, its routes — is the same work
+// either way, which is why only this much is behind an interface.
+type wgControl interface {
+	// apply takes configuration in the uapi format wireguard-go speaks. The
+	// kernel implementation parses it into wgctrl calls, which is a small
+	// amount of translation in exchange for one call shape everywhere else.
+	apply(uapi string) error
+	// dump returns the device's state, in the same format.
+	dump() (string, error)
+	close()
+}
+
 type Device struct {
+	ctrl wgControl
+
 	dev *device.Device
 	tun tun.Device
 
@@ -54,7 +71,7 @@ func NewUserspaceDevice(addrs []netip.Addr, dns []netip.Addr, mtu int, log *slog
 		return nil, fmt.Errorf("tunnel: creating the userspace interface: %w", err)
 	}
 	d := device.NewDevice(t, conn.NewDefaultBind(), deviceLogger(log))
-	return &Device{dev: d, tun: t, Net: n, log: log, peers: map[string]netip.AddrPort{}}, nil
+	return &Device{ctrl: userspaceControl{d}, dev: d, tun: t, Net: n, log: log, peers: map[string]netip.AddrPort{}}, nil
 }
 
 // Configure sets the private key and the port WireGuard listens on.
@@ -65,7 +82,7 @@ func (d *Device) Configure(private wgtypes.Key, listenPort int) error {
 	var b strings.Builder
 	fmt.Fprintf(&b, "private_key=%s\n", hex.EncodeToString(private[:]))
 	fmt.Fprintf(&b, "listen_port=%d\n", listenPort)
-	if err := d.dev.IpcSet(b.String()); err != nil {
+	if err := d.ctrl.apply(b.String()); err != nil {
 		return fmt.Errorf("tunnel: configuring the device: %w", err)
 	}
 	return nil
@@ -116,7 +133,7 @@ func (d *Device) SetPeer(p Peer) error {
 		fmt.Fprintf(&b, "persistent_keepalive_interval=%d\n", p.KeepaliveSeconds)
 	}
 
-	if err := d.dev.IpcSet(b.String()); err != nil {
+	if err := d.ctrl.apply(b.String()); err != nil {
 		return fmt.Errorf("tunnel: configuring peer %s: %w", shortKey(p.PublicKey), err)
 	}
 
@@ -138,7 +155,7 @@ func (d *Device) SetPeerEndpoint(pub wgtypes.Key, ep netip.AddrPort) error {
 	fmt.Fprintf(&b, "update_only=true\n")
 	fmt.Fprintf(&b, "endpoint=%s\n", ep.String())
 
-	if err := d.dev.IpcSet(b.String()); err != nil {
+	if err := d.ctrl.apply(b.String()); err != nil {
 		return fmt.Errorf("tunnel: moving peer %s: %w", shortKey(pub), err)
 	}
 
@@ -154,7 +171,7 @@ func (d *Device) RemovePeer(pub wgtypes.Key) error {
 	fmt.Fprintf(&b, "public_key=%s\n", hex.EncodeToString(pub[:]))
 	fmt.Fprintf(&b, "remove=true\n")
 
-	if err := d.dev.IpcSet(b.String()); err != nil {
+	if err := d.ctrl.apply(b.String()); err != nil {
 		return fmt.Errorf("tunnel: removing peer %s: %w", shortKey(pub), err)
 	}
 
@@ -175,7 +192,7 @@ func (d *Device) PeerEndpoint(pub wgtypes.Key) (netip.AddrPort, bool) {
 // ListenPort is the port WireGuard ended up on, which matters when Configure
 // was given zero and the kernel chose.
 func (d *Device) ListenPort() (int, error) {
-	raw, err := d.dev.IpcGet()
+	raw, err := d.ctrl.dump()
 	if err != nil {
 		return 0, err
 	}
@@ -192,7 +209,13 @@ func (d *Device) ListenPort() (int, error) {
 }
 
 // Up brings the device online.
+//
+// Only the userspace device has a notion of being down: the kernel's is up as
+// soon as the link is, which the platform code already did.
 func (d *Device) Up() error {
+	if d.dev == nil {
+		return nil
+	}
 	if err := d.dev.Up(); err != nil {
 		return fmt.Errorf("tunnel: bringing the device up: %w", err)
 	}
@@ -209,10 +232,16 @@ func (d *Device) Close() error {
 	d.closed = true
 	d.mu.Unlock()
 
-	// Closes the tun as well, which is why the tun is not closed here too.
-	d.dev.Close()
+	d.ctrl.close()
 	return nil
 }
+
+// userspaceControl is wireguard-go, which speaks uapi natively.
+type userspaceControl struct{ dev *device.Device }
+
+func (c userspaceControl) apply(uapi string) error { return c.dev.IpcSet(uapi) }
+func (c userspaceControl) dump() (string, error)   { return c.dev.IpcGet() }
+func (c userspaceControl) close()                  { c.dev.Close() }
 
 // deviceLogger routes wireguard-go's own logging into ours at debug level.
 // Its verbose level narrates every handshake, which is invaluable when a tunnel
@@ -250,7 +279,7 @@ type PeerStatus struct {
 // zero means the two ends never agreed on keys, which separates "the path is
 // not working" from "the path works and something above it does not".
 func (d *Device) Status() (map[string]PeerStatus, error) {
-	raw, err := d.dev.IpcGet()
+	raw, err := d.ctrl.dump()
 	if err != nil {
 		return nil, err
 	}

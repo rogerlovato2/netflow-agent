@@ -157,7 +157,7 @@ func New(cfg Config, log *slog.Logger) (*Engine, error) {
 	if cfg.Userspace {
 		dev, err = tunnel.NewUserspaceDevice(cfg.Addresses, cfg.DNS, cfg.MTU, log)
 	} else {
-		dev, err = tunnel.NewTUNDevice(cfg.TUNName, cfg.Addresses, cfg.MTU, log)
+		dev, err = tunnel.NewSystemDevice(cfg.TUNName, cfg.Addresses, cfg.MTU, log)
 	}
 	if err != nil {
 		return nil, err
