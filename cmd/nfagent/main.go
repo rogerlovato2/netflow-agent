@@ -126,6 +126,9 @@ type Config struct {
 	STUN       []string     `json:"stun,omitempty"`
 	Relay      *RelayConfig `json:"relay,omitempty"`
 	Peers      []PeerConfig `json:"peers"`
+	// Generation is the last reconnect request this machine acted on. Kept in
+	// the file so a restart does not act on the same one again.
+	Generation int64 `json:"generation,omitempty"`
 }
 
 // RelayConfig is a relay and a credential for it, both issued by the server.

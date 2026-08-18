@@ -219,6 +219,11 @@ type networkMap struct {
 	SignalURL string       `json:"signalUrl"`
 	Relay     *RelayConfig `json:"relay,omitempty"`
 	Peers     []PeerConfig `json:"peers"`
+	// Generation is bumped by the server to ask for everything to be
+	// negotiated again. Compared with what was last acted on rather than
+	// consumed as an event: an agent that was offline while it changed still
+	// sees it when it returns.
+	Generation int64 `json:"generation"`
 }
 
 // followTheMap keeps the engine's peer list in step with the server's.
@@ -266,6 +271,38 @@ func followTheMap(ctx context.Context, eng *engine.Engine, cfg *Config, path str
 						log.Debug("could not save the relay credential", "err", err)
 					}
 				}
+			}
+
+			// Two things the server can change about this machine that it
+			// cannot adopt in place.
+			//
+			// Its own address is written into the interface and into every
+			// peer's AllowedIPs on the other side; changing it means rebuilding
+			// the interface, which means starting over. The generation is the
+			// server asking for exactly that for its own reasons. Both are
+			// handled the same way, and the same way `up` would handle them:
+			// stop, and let the service manager start again. A process that
+			// tried to rebuild itself in place would be reimplementing what the
+			// service manager already does correctly.
+			if m.Address != "" && m.Address != cfg.Address {
+				log.Info("the server moved this machine; restarting",
+					"from", cfg.Address, "to", m.Address)
+				cfg.Address = m.Address
+				if err := saveConfig(path, cfg); err != nil {
+					log.Warn("could not save the new address", "err", err)
+				}
+				restart()
+				return
+			}
+			if m.Generation > cfg.Generation {
+				log.Info("the server asked for a reconnect; restarting",
+					"generation", m.Generation)
+				cfg.Generation = m.Generation
+				if err := saveConfig(path, cfg); err != nil {
+					log.Warn("could not save the generation", "err", err)
+				}
+				restart()
+				return
 			}
 
 			peers, perr := parsePeers(m.Peers)
@@ -348,4 +385,19 @@ func mapFingerprint(peers []PeerConfig) string {
 		b.WriteByte('\n')
 	}
 	return b.String()
+}
+
+// restart ends this process so the service manager starts a fresh one.
+//
+// Rebuilding an interface, its address and every tunnel from inside a running
+// process is possible and is a great deal of state to get right — and both
+// systemd and launchd already do it correctly, on every platform, with backoff.
+// Exiting non-zero is how a program asks them to.
+//
+// A machine running `nfagent up` by hand does not get restarted, and sees the
+// reason on the way out.
+func restart() {
+	fmt.Fprintln(os.Stderr,
+		"restarting to apply a change from the server; the service manager will start it again")
+	os.Exit(1)
 }
