@@ -64,6 +64,13 @@ const (
 	// offer is not junk, it is the negotiation, and dropping it costs a full
 	// retry cycle.
 	earlyMessages = 32
+
+	// keepaliveSeconds is sent to WireGuard for every peer.
+	//
+	// Both ends are usually behind NAT and neither can tell, so it is
+	// unconditional. Its cost is one small packet every twenty-five seconds;
+	// its absence is a tunnel that works until it goes quiet for a minute.
+	keepaliveSeconds = 25
 )
 
 // Peer is a peer this machine should have a tunnel to.
@@ -227,11 +234,22 @@ func (e *Engine) SetPeers(ctx context.Context, peers []Peer) {
 	}
 	// New, or changed enough to need rebuilding.
 	var starting []*peerLink
+	var moved []readdressing
 	for key, spec := range wanted {
 		if existing, ok := e.peers[key]; ok {
 			existing.mu.Lock()
+			prev := existing.spec
 			existing.spec = spec
 			existing.mu.Unlock()
+			// A peer that is already up can still have been given a different
+			// address. Swapping the note here and stopping — which is what this
+			// did — leaves the route and WireGuard's allowed IPs pointing at
+			// where the peer used to be: the tunnel stays up, the panel shows
+			// the new address, and nothing can reach it.
+			if !samePrefixes(prev.AllowedIPs, spec.AllowedIPs) ||
+				prev.PresharedKey != spec.PresharedKey {
+				moved = append(moved, readdressing{prev: prev, next: spec})
+			}
 			continue
 		}
 		link := &peerLink{
@@ -257,11 +275,92 @@ func (e *Engine) SetPeers(ctx context.Context, peers []Peer) {
 	}
 	e.mu.Unlock()
 
+	for _, m := range moved {
+		e.readdress(m.prev, m.next)
+	}
+
 	for _, link := range starting {
 		lctx, cancel := context.WithCancel(ctx)
 		link.cancel = cancel
 		go e.keepPeerConnected(lctx, link)
 	}
+}
+
+// readdressing is a peer that stayed but is now somewhere else.
+type readdressing struct{ prev, next Peer }
+
+// readdress moves a live peer to the addresses it now has.
+//
+// The path itself is left alone. Nothing about ICE or the handshake depends on
+// which mesh addresses travel through the tunnel, so tearing the peer down and
+// building it again would cost a reconnection to change a filter — and the
+// device's own SetPeer replaces the allowed IPs of a peer that exists without
+// disturbing its session.
+//
+// The peer may not be in the device yet, if it has never connected. That is not
+// a failure: whenever it does connect it is configured from the spec, which is
+// already the new one.
+func (e *Engine) readdress(prev, next Peer) {
+	for _, a := range prev.AllowedIPs {
+		if containsPrefix(next.AllowedIPs, a) {
+			continue
+		}
+		if err := e.dev.DelRoute(a); err != nil {
+			e.log.Debug("engine: could not drop an old route",
+				"peer", short(next.PublicKey), "prefix", a, "err", err)
+		}
+	}
+	for _, a := range next.AllowedIPs {
+		if containsPrefix(prev.AllowedIPs, a) {
+			continue
+		}
+		if err := e.dev.AddRoute(a); err != nil {
+			e.log.Warn("engine: could not route to a peer's new address",
+				"peer", short(next.PublicKey), "prefix", a, "err", err)
+		}
+	}
+
+	ep, known := e.dev.PeerEndpoint(next.PublicKey)
+	if !known {
+		return
+	}
+	if err := e.dev.SetPeer(tunnel.Peer{
+		PublicKey:        next.PublicKey,
+		PresharedKey:     next.PresharedKey,
+		Endpoint:         ep,
+		AllowedIPs:       next.AllowedIPs,
+		KeepaliveSeconds: keepaliveSeconds,
+	}); err != nil {
+		e.log.Warn("engine: could not move a peer to its new address",
+			"peer", short(next.PublicKey), "err", err)
+		return
+	}
+	e.log.Info("engine: peer moved",
+		"peer", short(next.PublicKey), "from", prev.AllowedIPs, "to", next.AllowedIPs)
+}
+
+func samePrefixes(a, b []netip.Prefix) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	// Order is the server's, and it has never promised one. Comparing pairwise
+	// would report a move every time the map came back shuffled, and each of
+	// those reports costs a peer its allowed IPs being rewritten.
+	for _, p := range a {
+		if !containsPrefix(b, p) {
+			return false
+		}
+	}
+	return true
+}
+
+func containsPrefix(list []netip.Prefix, p netip.Prefix) bool {
+	for _, q := range list {
+		if q == p {
+			return true
+		}
+	}
+	return false
 }
 
 // PeerState reports where a peer's negotiation stands.
@@ -497,15 +596,11 @@ func (e *Engine) connectOnce(ctx context.Context, link *peerLink) error {
 		err = e.dev.SetPeerEndpoint(spec.PublicKey, proxy.Endpoint())
 	} else {
 		err = e.dev.SetPeer(tunnel.Peer{
-			PublicKey:    spec.PublicKey,
-			PresharedKey: spec.PresharedKey,
-			Endpoint:     proxy.Endpoint(),
-			AllowedIPs:   spec.AllowedIPs,
-			// Both ends are usually behind NAT and neither can tell, so the
-			// keepalive is unconditional. Its cost is one small packet every
-			// twenty-five seconds; its absence is a tunnel that works until it
-			// goes quiet for a minute.
-			KeepaliveSeconds: 25,
+			PublicKey:        spec.PublicKey,
+			PresharedKey:     spec.PresharedKey,
+			Endpoint:         proxy.Endpoint(),
+			AllowedIPs:       spec.AllowedIPs,
+			KeepaliveSeconds: keepaliveSeconds,
 		})
 	}
 	if err != nil {

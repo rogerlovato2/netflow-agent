@@ -271,6 +271,10 @@ type PeerStatus struct {
 	LastHandshake int64 // unix seconds, zero if there has never been one
 	RXBytes       uint64
 	TXBytes       uint64
+	// AllowedIPs is what this peer is currently permitted to be. Read back
+	// from the device rather than remembered, because the interesting question
+	// is what WireGuard is enforcing, not what it was last asked to.
+	AllowedIPs []netip.Prefix
 }
 
 // Status reads the device's own view of its peers.
@@ -315,6 +319,10 @@ func (d *Device) Status() (map[string]PeerStatus, error) {
 			fmt.Sscanf(v, "%d", &st.RXBytes)
 		case "tx_bytes":
 			fmt.Sscanf(v, "%d", &st.TXBytes)
+		case "allowed_ip":
+			if p, err := netip.ParsePrefix(v); err == nil {
+				st.AllowedIPs = append(st.AllowedIPs, p)
+			}
 		}
 	}
 	flush()

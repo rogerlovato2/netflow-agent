@@ -327,3 +327,82 @@ func TestSignalFromAStrangerIsIgnored(t *testing.T) {
 		t.Error("the engine dropped its signal connection over a stranger's message")
 	}
 }
+
+// A machine can be given a different address while it is connected, and the
+// other machines have to follow it there.
+//
+// This is the failure it was written for: the peer's note was updated and
+// nothing else was, so the route and WireGuard's allowed IPs still pointed at
+// the address the machine used to have. The panel showed the new one, the
+// tunnel stayed up, and the machine was unreachable — which is the worst shape
+// a bug can take, because everything on screen says it is working.
+func TestAPeerThatMovesIsFollowed(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	url := signalServer(t)
+	a := newMachine(t, ctx, url, "10.23.0.1")
+	b := newMachine(t, ctx, url, "10.23.0.2")
+
+	waitUntil(t, "both on the signal server", 20*time.Second, func() bool {
+		return a.eng.SignalConnected() && b.eng.SignalConnected()
+	})
+
+	was := netip.PrefixFrom(b.addr, 32)
+	a.eng.SetPeers(ctx, []Peer{{PublicKey: b.pub, AllowedIPs: []netip.Prefix{was}}})
+	b.eng.SetPeers(ctx, []Peer{{PublicKey: a.pub,
+		AllowedIPs: []netip.Prefix{netip.PrefixFrom(a.addr, 32)}}})
+
+	waitUntil(t, "a path", 60*time.Second, func() bool {
+		return a.eng.PeerState(b.pub) == p2p.StateConnected
+	})
+	before, known := a.eng.Device().PeerEndpoint(b.pub)
+	if !known {
+		t.Fatal("state is connected but WireGuard was never told about the peer")
+	}
+
+	// The same machine, at another address.
+	now := netip.MustParsePrefix("10.23.0.20/32")
+	a.eng.SetPeers(ctx, []Peer{{PublicKey: b.pub, AllowedIPs: []netip.Prefix{now}}})
+
+	st, err := a.eng.Device().Status()
+	if err != nil {
+		t.Fatalf("reading the device: %v", err)
+	}
+	got := st[b.pub.String()].AllowedIPs
+	if !containsPrefix(got, now) {
+		t.Errorf("WireGuard allows %v, and the peer has moved to %s", got, now)
+	}
+	if containsPrefix(got, was) {
+		t.Errorf("WireGuard still allows %s, which the peer left", was)
+	}
+
+	// Where a peer is reachable has nothing to do with how it is reached, so
+	// moving it must not cost the path that was already working.
+	after, known := a.eng.Device().PeerEndpoint(b.pub)
+	if !known {
+		t.Fatal("the peer left WireGuard when it should only have moved")
+	}
+	if before != after {
+		t.Errorf("the tunnel was rebuilt to change an address: %s -> %s", before, after)
+	}
+	if got := a.eng.PeerState(b.pub); got != p2p.StateConnected {
+		t.Errorf("state is %s after a move, want %s", got, p2p.StateConnected)
+	}
+}
+
+// A map that comes back with the same addresses in another order is not a move.
+// Treating it as one would rewrite every peer's allowed IPs on every poll.
+func TestReorderedAddressesAreNotAMove(t *testing.T) {
+	x := netip.MustParsePrefix("10.24.0.1/32")
+	y := netip.MustParsePrefix("10.24.0.2/32")
+	if !samePrefixes([]netip.Prefix{x, y}, []netip.Prefix{y, x}) {
+		t.Error("a reordered list reads as a move")
+	}
+	if samePrefixes([]netip.Prefix{x}, []netip.Prefix{x, y}) {
+		t.Error("an added address does not read as a move")
+	}
+	if samePrefixes([]netip.Prefix{x}, []netip.Prefix{y}) {
+		t.Error("a different address does not read as a move")
+	}
+}
