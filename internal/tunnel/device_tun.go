@@ -63,7 +63,10 @@ func NewTUNDevice(name string, addrs []netip.Addr, mtu int, log *slog.Logger) (*
 
 	d := device.NewDevice(t, conn.NewDefaultBind(), deviceLogger(log))
 	log.Info("tunnel: interface up", "name", real, "addrs", addrs, "mtu", mtu)
-	return &Device{ctrl: userspaceControl{d}, dev: d, tun: t, name: real, log: log, peers: map[string]netip.AddrPort{}}, nil
+	return &Device{
+		ctrl: userspaceControl{d}, dev: d, tun: t, name: real, addrs: addrs,
+		log: log, peers: map[string]netip.AddrPort{},
+	}, nil
 }
 
 // explainTUNFailure turns the kernel's answer into the thing to go and do.

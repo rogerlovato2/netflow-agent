@@ -22,9 +22,15 @@ func configureInterface(name string, addrs []netip.Addr, mtu int) error {
 			if err := run("ifconfig", name, family, a.String(), "prefixlen", "128", "alias"); err != nil {
 				return err
 			}
+			if err := loopbackSelf(a); err != nil {
+				return err
+			}
 			continue
 		}
 		if err := run("ifconfig", name, family, a.String(), a.String(), "netmask", "255.255.255.255"); err != nil {
+			return err
+		}
+		if err := loopbackSelf(a); err != nil {
 			return err
 		}
 	}
@@ -60,4 +66,47 @@ func delRoute(_ string, p netip.Prefix) error {
 		family = "-inet6"
 	}
 	return run("route", "-n", "delete", family, p.String())
+}
+
+// loopbackSelf makes a machine's own mesh address reachable from itself.
+//
+// utun is point-to-point, and macOS sends a packet addressed to the interface's
+// own address out of that interface rather than looping it back. It reaches
+// WireGuard, which looks for a peer allowed to hold that address, finds none —
+// the address belongs to this machine, not to a peer — and drops it.
+//
+// The result is a machine whose own mesh address answers every other machine in
+// the mesh and not itself: `ping 10.90.0.3` from 10.90.0.3 times out, and so
+// does connecting to a service bound to it. Somebody testing their own service
+// from their own laptop concludes it is broken.
+//
+// Linux does not need this. An address there lands in the local routing table
+// automatically, which is the same thing this arranges by hand.
+func loopbackSelf(a netip.Addr) error {
+	// Removed first: the alias survives a process that was killed rather than
+	// stopped, and `ifconfig alias` on an address that is already there fails.
+	// The removal is expected to fail the first time, and its error is ignored.
+	_ = exec.Command("ifconfig", "lo0", family(a), a.String(), "-alias").Run()
+
+	if a.Is6() {
+		return run("ifconfig", "lo0", "inet6", a.String(), "prefixlen", "128", "alias")
+	}
+	return run("ifconfig", "lo0", "inet", a.String(), "netmask", "255.255.255.255", "alias")
+}
+
+// unconfigureInterface takes the loopback aliases back out.
+//
+// The interface itself disappears with the process that holds it; these do not,
+// and an address left on lo0 would answer for a mesh this machine has left.
+func unconfigureInterface(_ string, addrs []netip.Addr) {
+	for _, a := range addrs {
+		_ = exec.Command("ifconfig", "lo0", family(a), a.String(), "-alias").Run()
+	}
+}
+
+func family(a netip.Addr) string {
+	if a.Is6() {
+		return "inet6"
+	}
+	return "inet"
 }

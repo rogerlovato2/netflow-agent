@@ -55,6 +55,7 @@ func NewKernelDevice(name string, addrs []netip.Addr, mtu int, log *slog.Logger)
 		name:  name,
 		log:   log,
 		peers: map[string]netip.AddrPort{},
+		addrs: addrs,
 	}, nil
 }
 

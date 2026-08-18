@@ -51,6 +51,10 @@ type Device struct {
 	// name is what the operating system calls the interface, empty when the
 	// device keeps its stack inside this process.
 	name string
+	// addrs are the addresses configured on it, kept so that closing can undo
+	// what opening did. On macOS that includes an alias on lo0, which outlives
+	// the interface if nobody takes it away.
+	addrs []netip.Addr
 
 	log *slog.Logger
 
@@ -233,6 +237,7 @@ func (d *Device) Close() error {
 	d.mu.Unlock()
 
 	d.ctrl.close()
+	unconfigureInterface(d.name, d.addrs)
 	return nil
 }
 
