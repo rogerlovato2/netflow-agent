@@ -1,0 +1,62 @@
+name: release
+
+# Builds the agent for every platform a machine might join from, and attaches
+# them to the tag. Until this runs once there is nothing for scripts/install.sh
+# to download, which is the whole reason a `curl | sh` install does not work yet.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build every agent
+        run: |
+          set -eu
+          mkdir -p dist
+          version="${GITHUB_REF_NAME:-dev}"
+          # CGO off: SQLite here is pure Go and the agent needs none of it, so
+          # every one of these is a static binary that runs on any distribution
+          # without asking about libc.
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
+            os="${target%/*}"; arch="${target#*/}"
+            echo "building $os/$arch"
+            CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" \
+              go build -trimpath -ldflags="-s -w -X main.version=$version" \
+              -o "dist/nfagent-$os-$arch" ./cmd/nfagent
+          done
+          # The signalling server and the relay live here too: they are the two
+          # halves of the same protocol as the agent, and a release where they
+          # can disagree about it is not one worth having.
+          for target in linux/amd64 linux/arm64; do
+            os="${target%/*}"; arch="${target#*/}"
+            for cmd in nfsignal nfrelay; do
+              CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" \
+                go build -trimpath -ldflags="-s -w" \
+                -o "dist/$cmd-$os-$arch" "./cmd/$cmd"
+            done
+          done
+          cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS
+
+      # The menu bar client is built on the machine it runs on, not cross
+      # compiled. systray needs cgo and the platform's own toolkit — Cocoa here,
+      # GTK on Linux — and a cross build silently produces something that links
+      # and shows no icon.
+      - name: Note about the graphical client
+        run: echo "nfui is built per-platform; see the release notes"
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

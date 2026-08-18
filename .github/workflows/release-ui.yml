@@ -1,0 +1,40 @@
+name: release-ui
+
+# The menu bar client, built on macOS because it has to be.
+#
+# systray talks to Cocoa through cgo, so this cannot be cross compiled from the
+# Linux runner that builds everything else: the cross build links and produces a
+# binary that shows no icon and reports no error, which is the worst of both.
+#
+# What is still missing before this is something a person can just download:
+# signing and notarisation. macOS refuses an unsigned application downloaded
+# from the internet, and the certificate is an Apple developer account.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Build
+        run: |
+          set -eu
+          mkdir -p dist
+          for arch in amd64 arm64; do
+            CGO_ENABLED=1 GOOS=darwin GOARCH=$arch \
+              go build -trimpath -ldflags="-s -w" -o "dist/nfui-darwin-$arch" ./cmd/nfui
+          done
+          cd dist && shasum -a 256 * > SHA256SUMS-ui && cat SHA256SUMS-ui
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*

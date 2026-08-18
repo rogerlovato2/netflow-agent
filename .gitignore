@@ -1,0 +1,19 @@
+# Compiled binaries
+bin/
+
+# The SQLite database is the whole state of an install, and it holds the
+# server's and the clients' private keys. It must never reach a repository.
+*.db
+*.db-wal
+*.db-shm
+
+# Local configuration for a real install: the file that carries the endpoint,
+# the interface names and the admin password.
+docker/.env
+
+# rtk's cache
+.rtk/
+
+# macOS
+.DS_Store
+._*

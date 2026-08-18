@@ -1,0 +1,351 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"os"
+	"strings"
+	"time"
+
+	"github.com/rogerlovato2/netflow-agent/internal/engine"
+	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
+)
+
+// mapEvery is how often an enrolled agent asks who else is in the mesh.
+//
+// Polling rather than a push, for now: a poll that is a few seconds late costs
+// a few seconds before a new machine is reachable, while a push needs a second
+// long-lived connection per agent and a way to recover the updates missed while
+// it was down. The interval is what a person waits after enrolling a machine
+// before expecting to reach it, which is the only latency that matters here.
+const mapEvery = 20 * time.Second
+
+// reportEvery is how often a machine tells the server what it sees.
+//
+// The server carries none of the mesh's traffic, so this is the only way it
+// learns anything: without it the panel can say who enrolled and nothing about
+// whether any of them reach each other. Thirty seconds is chosen against how
+// long a person stares at a status screen before deciding something is wrong.
+const reportEvery = 30 * time.Second
+
+// peerReport is one machine's view of one peer, as the server stores it.
+type peerReport struct {
+	PeerKey   string `json:"peerKey"`
+	State     string `json:"state"`
+	Path      string `json:"path"`
+	RTTMillis int    `json:"rttMs"`
+	RX        uint64 `json:"rx"`
+	TX        uint64 `json:"tx"`
+	Handshake int64  `json:"handshake"`
+}
+
+// reportToServer tells the server what this machine sees, for as long as it runs.
+//
+// Failures are logged and dropped. A report is a snapshot with a fresh one
+// coming in thirty seconds, so retrying a stale one would only overwrite better
+// information with worse.
+func reportToServer(ctx context.Context, eng *engine.Engine, cfg *Config, log *slog.Logger) {
+	t := time.NewTicker(reportEvery)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+
+		rows, err := collectReport(eng)
+		if err != nil {
+			log.Debug("could not collect the status report", "err", err)
+			continue
+		}
+		if err := postReport(ctx, cfg, rows); err != nil && ctx.Err() == nil {
+			log.Debug("could not send the status report", "err", err)
+		}
+	}
+}
+
+// collectReport asks the engine, not the configuration file.
+//
+// The file is the last map that was written down; the engine is what is
+// actually being negotiated and carried. Reading the file here also meant two
+// goroutines touching the same slice — one writing it on every map update, the
+// other reading it on every report — which is a data race that would have gone
+// unnoticed until it corrupted a report.
+func collectReport(eng *engine.Engine) ([]peerReport, error) {
+	dev, err := eng.Device().Status()
+	if err != nil {
+		return nil, err
+	}
+	keys := eng.PeerKeys()
+	out := make([]peerReport, 0, len(keys))
+	for _, key := range keys {
+		id := key.String()
+		path := eng.PeerPath(key)
+		st := dev[id]
+		out = append(out, peerReport{
+			PeerKey:   id,
+			State:     string(eng.PeerState(key)),
+			Path:      path.Kind,
+			RTTMillis: int(path.RTT.Milliseconds()),
+			RX:        st.RXBytes,
+			TX:        st.TXBytes,
+			Handshake: st.LastHandshake,
+		})
+	}
+	return out, nil
+}
+
+func postReport(ctx context.Context, cfg *Config, rows []peerReport) error {
+	body, err := json.Marshal(map[string]any{"peers": rows})
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		cfg.Server+"/api/mesh/report", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+cfg.Token)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+	if resp.StatusCode/100 != 2 {
+		return fmt.Errorf("the server refused the report: %s", resp.Status)
+	}
+	return nil
+}
+
+// enrol joins the mesh and writes the identity this machine will keep.
+//
+// The key pair is generated here and the private half never leaves: the server
+// is given the public one, allocates an address, and hands back a token. That
+// is what keeps a compromised panel from being a compromised tunnel — it can
+// list machines and revoke them, and it cannot read a byte of what they say.
+func enrol(server, setupKey, name, out string) (*Config, error) {
+	if name == "" {
+		host, err := os.Hostname()
+		if err != nil {
+			return nil, err
+		}
+		name = host
+	}
+
+	priv, err := wgtypes.GeneratePrivateKey()
+	if err != nil {
+		return nil, err
+	}
+
+	body, _ := json.Marshal(map[string]string{
+		"setupKey":  setupKey,
+		"publicKey": priv.PublicKey().String(),
+		"name":      name,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	server = strings.TrimRight(server, "/")
+	url := server + "/api/mesh/register"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("reaching %s: %w", url, err)
+	}
+	defer resp.Body.Close()
+
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("the server refused the registration: %s: %s",
+			resp.Status, strings.TrimSpace(string(raw)))
+	}
+
+	var answer struct {
+		Address   string       `json:"address"`
+		Token     string       `json:"token"`
+		SignalURL string       `json:"signalUrl"`
+		Relay     *RelayConfig `json:"relay"`
+		Peers     []PeerConfig `json:"peers"`
+	}
+	if err := json.Unmarshal(raw, &answer); err != nil {
+		return nil, fmt.Errorf("the server's answer did not parse: %w", err)
+	}
+	if answer.SignalURL == "" {
+		return nil, errors.New("the server did not say where to signal; set it in the panel, under settings")
+	}
+
+	cfg := &Config{
+		PrivateKey: priv.String(),
+		Address:    answer.Address,
+		SignalURL:  answer.SignalURL,
+		Server:     server,
+		Token:      answer.Token,
+		Relay:      answer.Relay,
+		Peers:      answer.Peers,
+	}
+	if err := ensureConfigDir(out); err != nil {
+		return nil, fmt.Errorf("creating %s: %w", out, err)
+	}
+	if err := saveConfig(out, cfg); err != nil {
+		return nil, err
+	}
+
+	fmt.Printf("joined the mesh as %s\n", answer.Address)
+	return cfg, nil
+}
+
+// networkMap is what the server answers.
+type networkMap struct {
+	Address   string       `json:"address"`
+	SignalURL string       `json:"signalUrl"`
+	Relay     *RelayConfig `json:"relay,omitempty"`
+	Peers     []PeerConfig `json:"peers"`
+}
+
+// followTheMap keeps the engine's peer list in step with the server's.
+//
+// A failed poll is logged and nothing else: the peers already configured keep
+// working, which is the behaviour worth having — a management server that is
+// down should cost new machines, not existing tunnels.
+func followTheMap(ctx context.Context, eng *engine.Engine, cfg *Config, path string, log *slog.Logger) {
+	t := time.NewTicker(mapEvery)
+	defer t.Stop()
+
+	// Seeded from what was already applied, so an unchanged map after a restart
+	// is not announced as news.
+	last := mapFingerprint(cfg.Peers)
+	for {
+		m, err := fetchMap(ctx, cfg)
+		if err != nil {
+			if ctx.Err() == nil {
+				log.Warn("could not fetch the network map", "err", err)
+			}
+		} else {
+			// The signal server can be moved on the server without this agent
+			// noticing: the client was built with the URL it started with, and
+			// rebuilding it would mean tearing down every negotiation in flight.
+			// Saying so is what turns a fleet that silently stops connecting
+			// into one line in a log.
+			if m.SignalURL != "" && m.SignalURL != cfg.SignalURL {
+				log.Warn("the server moved the signal server; this agent is still using the old one",
+					"running", cfg.SignalURL, "configured", m.SignalURL,
+					"fix", "restart the agent, or re-register it")
+			}
+			// Applied on every map and not only when the peer list changes: the
+			// credential expires, so a machine holding the first one it was
+			// given would lose the ability to relay a day later — and would
+			// look like a NAT problem when it did.
+			//
+			// Kept in the file too. That copy is worth exactly one day of the
+			// management server being unreachable, which is precisely when a
+			// machine most needs the relay it already knows about.
+			if m.Relay != nil {
+				eng.SetRelay(m.Relay.URL, m.Relay.Username, m.Relay.Password)
+				if cfg.Relay == nil || *cfg.Relay != *m.Relay {
+					cfg.Relay = m.Relay
+					if err := saveConfig(path, cfg); err != nil {
+						log.Debug("could not save the relay credential", "err", err)
+					}
+				}
+			}
+
+			peers, perr := parsePeers(m.Peers)
+			if perr != nil {
+				log.Warn("the network map did not parse", "err", perr)
+			} else {
+				// Compared before applying, so an unchanged map is not reported
+				// as an event every twenty seconds. SetPeers is a reconcile and
+				// would do no harm; the log would.
+				if fingerprint := mapFingerprint(m.Peers); fingerprint != last {
+					log.Info("network map updated", "peers", len(peers))
+					last = fingerprint
+					// Written back so the next start has it. A cache that is
+					// never refreshed goes stale exactly when it is needed:
+					// after the machine has been away long enough for the mesh
+					// to have moved on.
+					cfg.Peers = m.Peers
+					if err := saveConfig(path, cfg); err != nil {
+						log.Warn("could not save the network map", "err", err)
+					}
+				}
+				eng.SetPeers(ctx, peers)
+			}
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+	}
+}
+
+func fetchMap(ctx context.Context, cfg *Config) (networkMap, error) {
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, cfg.Server+"/api/mesh/map", nil)
+	if err != nil {
+		return networkMap{}, err
+	}
+	req.Header.Set("Authorization", "Bearer "+cfg.Token)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return networkMap{}, err
+	}
+	defer resp.Body.Close()
+
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode != http.StatusOK {
+		return networkMap{}, fmt.Errorf("%s: %s", resp.Status, strings.TrimSpace(string(raw)))
+	}
+	var m networkMap
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return networkMap{}, err
+	}
+	return m, nil
+}
+
+// saveConfig rewrites the file with the peer list it now holds.
+//
+// Written whole rather than patched: the file is small, and a partial write
+// that lost the private key would cost the machine its identity.
+func saveConfig(path string, cfg *Config) error {
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, append(data, '\n'), 0o600)
+}
+
+// mapFingerprint is enough to tell one peer list from another.
+func mapFingerprint(peers []PeerConfig) string {
+	var b strings.Builder
+	for _, p := range peers {
+		b.WriteString(p.PublicKey)
+		b.WriteByte(' ')
+		b.WriteString(strings.Join(p.AllowedIPs, ","))
+		b.WriteByte('\n')
+	}
+	return b.String()
+}

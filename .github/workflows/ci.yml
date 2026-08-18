@@ -1,0 +1,24 @@
+name: ci
+
+# Runs on every push and pull request. The tests exist and nothing ran them,
+# which is a slower way of not having them.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: gofmt -l ./cmd ./internal | tee /dev/stderr | (! read)
+      - run: go vet ./...
+      # -race because the bugs this project has actually had were races and
+      # ordering, and a suite that passes without it has been lying before.
+      - run: go test -race -count=1 -timeout 15m ./...
+
