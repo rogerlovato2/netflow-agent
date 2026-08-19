@@ -27,6 +27,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -165,7 +166,7 @@ func Apply(ctx context.Context, target, current string, log *slog.Logger) (bool,
 	tmp := self + ".new"
 	if err := download(ctx, assetURL(target, name), tmp, want); err != nil {
 		os.Remove(tmp)
-		return false, err
+		return false, explainWrite(err, self)
 	}
 	// Run before it is installed. This is what catches a build for the wrong
 	// architecture, a truncated download that somehow matched, and a binary
@@ -178,7 +179,7 @@ func Apply(ctx context.Context, target, current string, log *slog.Logger) (bool,
 
 	if err := os.Rename(tmp, self); err != nil {
 		os.Remove(tmp)
-		return false, fmt.Errorf("installing over %s: %w", self, err)
+		return false, explainWrite(fmt.Errorf("installing over %s: %w", self, err), self)
 	}
 	log.Info("update: installed", "from", current, "to", target, "path", self)
 	return true, nil
@@ -321,4 +322,19 @@ func parseVersion(v string) []int {
 		out[i] = n
 	}
 	return out
+}
+
+// explainWrite turns "read-only file system" into the thing to go and do.
+//
+// The service file hardens the agent by making everything outside its own
+// configuration read-only, which is right for everything it does except the one
+// thing the panel can ask of it. When that is what happened, the message a
+// person sees should not be four words about a filesystem from a process that
+// had just downloaded and verified a release it then could not install.
+func explainWrite(err error, path string) error {
+	if !errors.Is(err, syscall.EROFS) {
+		return err
+	}
+	return fmt.Errorf("%s cannot be written by this service: re-run the installer "+
+		"so the service file allows it (%w)", filepath.Dir(path), err)
 }

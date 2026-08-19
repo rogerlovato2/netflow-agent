@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -246,5 +247,36 @@ func TestVersionOrder(t *testing.T) {
 		if got := newer(c.target, c.current); got != c.want {
 			t.Errorf("newer(%q, %q) = %v, want %v", c.target, c.current, got, c.want)
 		}
+	}
+}
+
+// The failure that a hardened service produces, and the sentence it should turn
+// into.
+//
+// ProtectSystem=strict makes the directory the binary lives in read-only for
+// the service, which is right for everything the agent does except replacing
+// itself. What came out of it was four words about a filesystem, from a process
+// that had just downloaded and verified a release it then could not install.
+func TestAReadOnlyDirectorySaysWhatToDo(t *testing.T) {
+	err := explainWrite(&os.PathError{
+		Op: "open", Path: "/usr/local/bin/nfagent.new", Err: syscall.EROFS,
+	}, "/usr/local/bin/nfagent")
+
+	if !strings.Contains(err.Error(), "/usr/local/bin") {
+		t.Errorf("the message does not name the directory: %v", err)
+	}
+	if !strings.Contains(err.Error(), "installer") {
+		t.Errorf("the message does not say what to do: %v", err)
+	}
+	// And the original is still in there, for whoever wants the real cause.
+	if !errors.Is(err, syscall.EROFS) {
+		t.Error("the underlying error was lost")
+	}
+
+	// Anything else is passed through untouched: a message invented for a
+	// failure it does not fit is worse than the failure.
+	other := errors.New("no space left on device")
+	if got := explainWrite(other, "/usr/local/bin/nfagent"); got != other {
+		t.Errorf("an unrelated error was rewritten: %v", got)
 	}
 }

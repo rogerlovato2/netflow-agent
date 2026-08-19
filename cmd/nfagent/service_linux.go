@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 )
 
 const serviceUnit = "/etc/systemd/system/netflow-agent.service"
@@ -43,7 +44,13 @@ ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
 NoNewPrivileges=true
-ReadWritePaths=/etc/netflow
+ReadWritePaths=/etc/netflow %s
+# The second path is the directory the binary lives in, and it is here for one
+# reason: replacing itself. ProtectSystem=strict makes /usr read-only for this
+# service, which is right for everything the agent does except the one thing it
+# is asked to do from the panel — and the failure it produced said only "read-
+# only file system", from a process that had just downloaded and verified a
+# release it then could not install.
 # systemd creates /run/netflow before start and removes it after, which is
 # where the control socket lives. Without it ProtectSystem=strict above leaves
 # /run read-only and the socket cannot be bound — the hardening would quietly
@@ -53,7 +60,7 @@ RuntimeDirectoryMode=0755
 
 [Install]
 WantedBy=multi-user.target
-`, binary)
+`, binary, filepath.Dir(binary))
 
 	if err := os.WriteFile(serviceUnit, []byte(unit), 0o644); err != nil {
 		return fmt.Errorf("writing %s: %w", serviceUnit, err)
