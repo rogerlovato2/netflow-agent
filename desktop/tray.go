@@ -5,6 +5,7 @@ import (
 	"net/netip"
 	"slices"
 	"sync"
+	"time"
 
 	"fyne.io/systray"
 	wruntime "github.com/wailsapp/wails/v2/pkg/runtime"
@@ -34,7 +35,9 @@ type tray struct {
 
 	status   *systray.MenuItem
 	address  *systray.MenuItem
+	uptime   *systray.MenuItem
 	machines *systray.MenuItem
+	connect  *systray.MenuItem
 	rows     []*systray.MenuItem
 
 	mu    sync.Mutex
@@ -51,6 +54,9 @@ func (t *tray) build() {
 	t.address = systray.AddMenuItem("", "")
 	t.address.Disable()
 	t.address.Hide()
+	t.uptime = systray.AddMenuItem("", "")
+	t.uptime.Disable()
+	t.uptime.Hide()
 
 	systray.AddSeparator()
 	// A submenu rather than a list in the open: this menu is looked at to
@@ -67,6 +73,15 @@ func (t *tray) build() {
 	systray.AddSeparator()
 	open := systray.AddMenuItem("Open netflow", "")
 	copyAddr := systray.AddMenuItem("Copy my address", "")
+	t.connect = systray.AddMenuItem("Disconnect", "")
+
+	systray.AddSeparator()
+	// The panel and the log live here rather than in the window: they are the
+	// two things somebody wants when they are not going to read anything else,
+	// and reaching them should not cost a window.
+	panel := systray.AddMenuItem("Open the panel", "")
+	logs := systray.AddMenuItem("Open the log", "")
+
 	systray.AddSeparator()
 	quit := systray.AddMenuItem("Quit", "")
 
@@ -77,6 +92,13 @@ func (t *tray) build() {
 				wruntime.WindowShow(t.app.ctx)
 			case <-copyAddr.ClickedCh:
 				t.app.Copy(t.app.Status().Address)
+			case <-t.connect.ClickedCh:
+				// Whatever it is now, ask for the other one.
+				t.app.SetConnected(t.app.Status().Paused)
+			case <-panel.ClickedCh:
+				t.app.OpenPanel()
+			case <-logs.ClickedCh:
+				t.app.OpenLog()
 			case <-quit.ClickedCh:
 				wruntime.Quit(t.app.ctx)
 				return
@@ -95,12 +117,25 @@ func (t *tray) update(st Status) {
 		}
 	}
 
-	solid := st.Reachable && st.Signal && (total == 0 || up == total)
+	solid := st.Reachable && st.Signal && !st.Paused && (total == 0 || up == total)
 	t.setIcon(solid)
+
+	if st.Paused {
+		t.connect.SetTitle("Connect")
+	} else {
+		t.connect.SetTitle("Disconnect")
+	}
+	if st.Reachable {
+		t.connect.Show()
+	} else {
+		t.connect.Hide()
+	}
 
 	switch {
 	case !st.Reachable:
 		t.status.SetTitle(orDefault(st.Error, "the agent did not answer"))
+	case st.Paused:
+		t.status.SetTitle("disconnected by request")
 	case !st.Signal:
 		t.status.SetTitle("cannot reach the signal server")
 	case total == 0:
@@ -116,7 +151,7 @@ func (t *tray) update(st Status) {
 		t.address.Show()
 	}
 
-	if total == 0 {
+	if total == 0 || st.Paused {
 		t.machines.Hide()
 	} else {
 		t.machines.SetTitle(fmt.Sprintf("Machines (%d)", total))
@@ -124,6 +159,13 @@ func (t *tray) update(st Status) {
 	}
 
 	order := ordered(st.Peers)
+	if st.StartedAt > 0 {
+		t.uptime.SetTitle("up " + duration(time.Since(time.Unix(st.StartedAt, 0))))
+		t.uptime.Show()
+	} else {
+		t.uptime.Hide()
+	}
+
 	for i, r := range t.rows {
 		if i >= len(order) {
 			r.Hide()
@@ -203,6 +245,34 @@ func describe(p Peer) string {
 		return dotOn + "  " + name
 	}
 	return dotOff + "  " + name
+}
+
+// duration says how long, in the two largest units that apply.
+//
+// Two, because one is imprecise enough to be useless at the boundaries — "1h"
+// covers an hour and fifty-nine minutes — and three is a number nobody reads to
+// the end of.
+func duration(d time.Duration) string {
+	s := int(d.Seconds())
+	if s < 0 {
+		return "—"
+	}
+	if s < 60 {
+		return fmt.Sprintf("%ds", s)
+	}
+	days, hours, mins := s/86400, (s%86400)/3600, (s%3600)/60
+	switch {
+	case days > 0 && hours > 0:
+		return fmt.Sprintf("%dd %dh", days, hours)
+	case days > 0:
+		return fmt.Sprintf("%dd", days)
+	case hours > 0 && mins > 0:
+		return fmt.Sprintf("%dh %dm", hours, mins)
+	case hours > 0:
+		return fmt.Sprintf("%dh", hours)
+	default:
+		return fmt.Sprintf("%dm %ds", mins, s%60)
+	}
 }
 
 func orDefault(s, fallback string) string {

@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { EventsOn } from '../wailsjs/runtime/runtime'
-import { Copy, Fit, OpenLog, OpenPanel, Status } from '../wailsjs/go/main/App'
+import { Copy, Fit, OpenLog, SetConnected, Status } from '../wailsjs/go/main/App'
 import type { main } from '../wailsjs/go/models'
 import { Traffic, useTraffic } from './Traffic'
 import { ago, compareAddresses, duration, size } from './format'
@@ -58,10 +58,21 @@ function Sized({ children }: { children: React.ReactNode }) {
     // Rounded up: a fractional height rounds down into a scrollbar over the
     // last pixel of the footer.
     const tell = () => void Fit(Math.ceil(el.getBoundingClientRect().height))
+
     const obs = new ResizeObserver(tell)
     obs.observe(el)
     tell()
-    return () => obs.disconnect()
+
+    // And again on a slow clock. The observer only fires when the content
+    // changes size, which is not the only way the two get out of step: a
+    // window dragged taller by hand leaves the content where it was, and
+    // nothing would ever pull it back. This is what "fits its content" costs —
+    // the height is not somebody's to choose, only the width.
+    const t = setInterval(tell, 1000)
+    return () => {
+      obs.disconnect()
+      clearInterval(t)
+    }
   }, [])
 
   return <div ref={ref}>{children}</div>
@@ -117,16 +128,42 @@ function Connected({
   return (
     <>
       <Head status={status} />
-      <Traffic {...traffic} />
-      <Machines peers={status.peers ?? []} />
+      {status.paused ? <Paused /> : <Traffic {...traffic} />}
+      {!status.paused && <Machines peers={status.peers ?? []} />}
       <Foot status={status} />
     </>
   )
 }
 
+/**
+ * What is shown instead of a graph and a list when the tunnels are down.
+ *
+ * Not an empty list: an empty list means the map has nobody in it, which is a
+ * policy problem and sends somebody to the panel. This is the machine doing
+ * exactly what it was told.
+ */
+function Paused() {
+  return (
+    <p
+      className="card"
+      style={{
+        margin: '0 16px 14px',
+        padding: 14,
+        color: 'var(--text-faint)',
+        fontSize: 12,
+        lineHeight: 1.5,
+      }}
+    >
+      The tunnels are down because this machine was asked to take them down.
+      Nothing on the mesh can reach it and it can reach nothing. The agent is
+      still running, and a restart brings it back connected.
+    </p>
+  )
+}
+
 /** The answer to "am I connected", in the largest thing on the screen. */
 function Head({ status }: { status: main.Status }) {
-  const live = status.signalConnected
+  const live = status.signalConnected && !status.paused
   const peers = status.peers ?? []
   const up = peers.filter(connected).length
 
@@ -135,16 +172,20 @@ function Head({ status }: { status: main.Status }) {
       <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
         <span className={live ? 'dot dot-on' : 'dot dot-off'} />
         <span style={{ fontSize: 15, fontWeight: 500 }}>
-          {live ? 'on the mesh' : 'no signalling'}
+          {status.paused ? 'disconnected' : live ? 'on the mesh' : 'no signalling'}
         </span>
+        <span style={{ flex: 1 }} />
+        <Switch paused={status.paused} />
       </div>
 
       <Address value={status.address} />
 
       <div style={{ marginTop: 8, display: 'flex', gap: 6, flexWrap: 'wrap' }}>
-        <span className="chip" style={{ color: 'var(--text-dim)' }}>
-          {up}/{peers.length} {peers.length === 1 ? 'tunnel' : 'tunnels'}
-        </span>
+        {!status.paused && (
+          <span className="chip" style={{ color: 'var(--text-dim)' }}>
+            {up}/{peers.length} {peers.length === 1 ? 'tunnel' : 'tunnels'}
+          </span>
+        )}
         {status.interface && (
           <span className="chip" style={{ color: 'var(--text-faint)' }}>
             {status.interface}
@@ -155,13 +196,47 @@ function Head({ status }: { status: main.Status }) {
             chip. Its absence is what somebody would want to know: it is the
             difference between "some peer will not connect" and "all of them
             will". */}
-        {!status.relayConfigured && (
+        {!status.relayConfigured && !status.paused && (
           <span className="chip" style={{ color: 'var(--warn)' }}>
             no relay
           </span>
         )}
       </div>
     </div>
+  )
+}
+
+/**
+ * The one control in this window.
+ *
+ * Disconnecting takes every tunnel down and leaves the agent running; it does
+ * not leave the mesh, and it is not remembered — an agent that restarts comes
+ * back connected. A machine that quietly stayed off across a reboot is a
+ * machine somebody spends an afternoon debugging.
+ *
+ * It disables itself while the agent is answering. The call takes a moment
+ * because saying goodbye to the peers is part of it, and a button that can be
+ * pressed again in that moment is a button somebody presses again.
+ */
+function Switch({ paused }: { paused: boolean }) {
+  const [busy, setBusy] = useState(false)
+
+  return (
+    <button
+      className="action"
+      disabled={busy}
+      onClick={() => {
+        setBusy(true)
+        void SetConnected(paused).finally(() => setBusy(false))
+      }}
+      style={{
+        color: busy ? 'var(--text-faint)' : paused ? 'var(--accent)' : 'var(--text-dim)',
+        borderColor: paused && !busy ? 'var(--accent)' : 'var(--border)',
+        cursor: busy ? 'default' : 'pointer',
+      }}
+    >
+      {busy ? '…' : paused ? 'Connect' : 'Disconnect'}
+    </button>
   )
 }
 
@@ -473,16 +548,9 @@ function Foot({ status }: { status: main.Status }) {
       >
         {status.agentVersion || status.version}
       </span>
-      <span style={{ display: 'flex', gap: 6 }}>
-        <button className="action" onClick={() => void OpenLog()}>
-          Log
-        </button>
-        {status.server && (
-          <button className="action" onClick={() => void OpenPanel()}>
-            Panel
-          </button>
-        )}
-      </span>
+      {status.error && (
+        <span style={{ fontSize: 11, color: 'var(--danger)' }}>{status.error}</span>
+      )}
     </div>
   )
 }

@@ -45,7 +45,34 @@ func status(args []string) error {
 	return nil
 }
 
+// setPaused asks a running agent to take its tunnels down, or put them back.
+//
+// It is not a setting: nothing is written, and an agent that restarts comes
+// back connected. A machine that quietly stayed off the mesh across a reboot is
+// a machine somebody will spend an afternoon debugging.
+func setPaused(pause bool) error {
+	what := "resume"
+	if pause {
+		what = "pause"
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := tellControl(ctx, "/"+what); err != nil {
+		return fmt.Errorf("the agent did not answer (%w); is it running?", err)
+	}
+	if pause {
+		fmt.Println("the tunnels are down; `nfagent resume` puts them back")
+	} else {
+		fmt.Println("back on the mesh")
+	}
+	return nil
+}
+
 func printLive(st ControlStatus) error {
+	if st.Paused {
+		fmt.Println("paused: the tunnels are down by request (`nfagent resume` puts them back)")
+		fmt.Println()
+	}
 	fmt.Printf("address    %s\n", st.Address)
 	fmt.Printf("interface  %s\n", orNone(st.Interface, "userspace, invisible to this machine"))
 	fmt.Printf("signal     %s\n", connected(st.Signal))

@@ -14,6 +14,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rogerlovato2/netflow-agent/internal/engine"
@@ -270,6 +271,7 @@ type updatePolicy struct {
 var lastMap struct {
 	sync.Mutex
 	byKey map[string]PeerConfig
+	all   []PeerConfig
 }
 
 func setLastMap(peers []PeerConfig) {
@@ -280,6 +282,49 @@ func setLastMap(peers []PeerConfig) {
 	lastMap.Lock()
 	defer lastMap.Unlock()
 	lastMap.byKey = byKey
+	lastMap.all = append([]PeerConfig(nil), peers...)
+}
+
+// lastMapPeers is the whole of the last map, for reconnecting without waiting
+// for the next poll.
+func lastMapPeers() []PeerConfig {
+	lastMap.Lock()
+	defer lastMap.Unlock()
+	return append([]PeerConfig(nil), lastMap.all...)
+}
+
+// paused is whether somebody at this machine asked it to leave the mesh alone.
+//
+// Not a setting and not remembered: it lives as long as the process does, and
+// an agent that comes back after a restart comes back connected. A machine
+// that quietly stayed off the mesh across a reboot is a machine somebody will
+// spend an afternoon debugging.
+var paused atomic.Bool
+
+// Paused says whether the tunnels are down by request.
+func Paused() bool { return paused.Load() }
+
+// Pause takes every tunnel down and leaves the agent running.
+//
+// Goodbye first, so the peers drop this machine now rather than discovering it
+// when their negotiation times out. Then an empty peer list, which is the same
+// path a machine removed from the map takes: the sessions close, the routes go,
+// and WireGuard is left with nothing it will accept a packet from.
+func Pause(ctx context.Context, eng *engine.Engine) {
+	paused.Store(true)
+	eng.Goodbye()
+	eng.SetPeers(ctx, nil)
+}
+
+// Resume puts back what the last map said, without waiting for the next poll.
+func Resume(ctx context.Context, eng *engine.Engine, log *slog.Logger) {
+	paused.Store(false)
+	peers, err := parsePeers(lastMapPeers())
+	if err != nil {
+		log.Warn("could not restore the peer list", "err", err)
+		return
+	}
+	eng.SetPeers(ctx, peers)
 }
 
 // peerFromMap is what the server last said about one peer. The zero value is
@@ -446,7 +491,13 @@ func followTheMap(ctx context.Context, eng *engine.Engine, cfg *Config, path str
 						log.Warn("could not save the network map", "err", err)
 					}
 				}
-				eng.SetPeers(ctx, peers)
+				if paused.Load() {
+					// The map is still followed and still saved — only not
+					// applied. Reconnecting then costs nothing but a call.
+					eng.SetPeers(ctx, nil)
+				} else {
+					eng.SetPeers(ctx, peers)
+				}
 			}
 		}
 

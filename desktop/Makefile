@@ -11,7 +11,7 @@ APP   := build/bin/netflow.app
 # build from a tag says the tag and a build from a working tree says so too.
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 
-.PHONY: app dev icon clean
+.PHONY: app dev install icon clean
 
 # app builds the release bundle and signs it ad hoc.
 #
@@ -26,6 +26,13 @@ app:
 	xattr -cr $(APP)
 	codesign --force --deep --sign - $(APP)
 	@echo "built $(APP)"
+
+# install puts the built bundle where the Finder, Spotlight and the Dock look
+# for it. Replaces whatever is there, so it is also how an update is applied.
+install: app
+	rm -rf /Applications/netflow.app
+	cp -R $(APP) /Applications/netflow.app
+	@echo "installed /Applications/netflow.app"
 
 # dev runs it with a live frontend. It signs on every rebuild, so it needs the
 # bundle somewhere the sync does not reach.

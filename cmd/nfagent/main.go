@@ -51,6 +51,8 @@ func usage() {
   nfagent up --setup-key <key> --server <url>   join the mesh and stay, in the foreground
   nfagent up                                    start again, already enrolled
   nfagent status                                what this machine sees
+  nfagent pause                                 take the tunnels down, keep the agent
+  nfagent resume                                put them back
   nfagent version                               which build this is
   nfagent key                                   print a key pair, for a hand-written setup
 
@@ -88,6 +90,10 @@ func run() error {
 		return up(os.Args[2:])
 	case "status":
 		return status(os.Args[2:])
+	case "pause":
+		return setPaused(true)
+	case "resume":
+		return setPaused(false)
 	case "version", "--version", "-v":
 		fmt.Println(version)
 		return nil

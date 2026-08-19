@@ -86,6 +86,9 @@ type ControlStatus struct {
 	Signal    bool          `json:"signalConnected"`
 	Relay     bool          `json:"relayConfigured"`
 	Peers     []ControlPeer `json:"peers"`
+	// Paused is whether the tunnels are down because somebody at this machine
+	// asked for it, which is the one state that looks like a fault and is not.
+	Paused bool `json:"paused"`
 	// StartedAt is when this agent came up, in unix seconds.
 	//
 	// The agent restarts itself to apply some changes from the server, so this
@@ -116,11 +119,15 @@ type ControlPeer struct {
 
 // serveControl answers on the socket for as long as ctx lives.
 //
-// Read-only, deliberately. Everything that changes this machine's membership —
-// joining, leaving, which mesh — is a decision with a credential behind it, and
-// exposing it here would mean a local socket that can move a machine between
-// meshes. What a graphical client needs is to show what is happening, and that
-// is all this gives it.
+// It reads, and it can stop and start the tunnels. Nothing here changes what
+// this machine is: joining, leaving and which mesh are decisions with a
+// credential behind them, and exposing them on a local socket would mean a
+// process running as any logged-in user could move the machine between meshes.
+//
+// Pausing is a different kind of decision and belongs to whoever is sitting at
+// the machine. It takes nothing away that the person could not take away by
+// pulling the cable, it is not remembered across a restart, and the panel sees
+// the machine go quiet either way.
 func serveControl(ctx context.Context, eng *engine.Engine, cfg *Config, log *slog.Logger) {
 	path := controlSocket()
 	// A socket left behind by a killed agent blocks the next one from binding,
@@ -163,6 +170,18 @@ func serveControl(ctx context.Context, eng *engine.Engine, cfg *Config, log *slo
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(collectControlStatus(eng, cfg))
 	})
+	// ctx and not the request's: a request ends the moment it is answered, and
+	// the peers started from it would be cancelled with it.
+	mux.HandleFunc("POST /pause", func(w http.ResponseWriter, _ *http.Request) {
+		log.Info("control: pausing on request")
+		Pause(ctx, eng)
+		w.WriteHeader(http.StatusNoContent)
+	})
+	mux.HandleFunc("POST /resume", func(w http.ResponseWriter, _ *http.Request) {
+		log.Info("control: resuming on request")
+		Resume(ctx, eng, log)
+		w.WriteHeader(http.StatusNoContent)
+	})
 
 	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	go func() {
@@ -184,6 +203,7 @@ func collectControlStatus(eng *engine.Engine, cfg *Config) ControlStatus {
 	st := ControlStatus{
 		StartedAt: startedAt.Unix(),
 		Version:   version,
+		Paused:    Paused(),
 		Address:   cfg.Address,
 		Interface: eng.Device().Name(),
 		PublicKey: eng.PublicKey().String(),
@@ -218,13 +238,13 @@ func collectControlStatus(eng *engine.Engine, cfg *Config) ControlStatus {
 	return st
 }
 
-// askControl reads the status from a running agent.
+// controlClient speaks HTTP over the socket.
 //
-// The http client is given a dialer that ignores the address and opens the
-// socket instead, which is the least surprising way to speak HTTP over a unix
-// socket: the URL is a formality and the path is the real destination.
-func askControl(ctx context.Context) (ControlStatus, error) {
-	client := &http.Client{
+// The dialer ignores the address and opens the socket instead, which is the
+// least surprising way to do this: the URL is a formality and the path is the
+// real destination.
+func controlClient() *http.Client {
+	return &http.Client{
 		Transport: &http.Transport{
 			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 				var d net.Dialer
@@ -233,11 +253,37 @@ func askControl(ctx context.Context) (ControlStatus, error) {
 		},
 		Timeout: 5 * time.Second,
 	}
+}
+
+// tellControl asks a running agent to do something. Nothing comes back but
+// whether it was done.
+func tellControl(ctx context.Context, path string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://agent"+path, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := controlClient().Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("the agent answered %s", resp.Status)
+	}
+	return nil
+}
+
+// askControl reads the status from a running agent.
+//
+// The http client is given a dialer that ignores the address and opens the
+// socket instead, which is the least surprising way to speak HTTP over a unix
+// socket: the URL is a formality and the path is the real destination.
+func askControl(ctx context.Context) (ControlStatus, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://agent/status", nil)
 	if err != nil {
 		return ControlStatus{}, err
 	}
-	resp, err := client.Do(req)
+	resp, err := controlClient().Do(req)
 	if err != nil {
 		return ControlStatus{}, err
 	}

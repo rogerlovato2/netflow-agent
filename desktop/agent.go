@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -25,6 +26,9 @@ type Status struct {
 	Signal    bool   `json:"signalConnected"`
 	Relay     bool   `json:"relayConfigured"`
 	Peers     []Peer `json:"peers"`
+	// Paused is whether the tunnels are down because somebody at this machine
+	// asked for it, which is the one state that looks like a fault and is not.
+	Paused bool `json:"paused"`
 	// StartedAt is when the agent came up, in unix seconds. It resets when the
 	// agent restarts, which is the honest thing for it to do.
 	StartedAt int64 `json:"startedAt"`
@@ -96,6 +100,24 @@ func fetchStatus(ctx context.Context) Status {
 	}
 	st.Reachable = true
 	return st
+}
+
+// tellAgent asks the agent to do something. Nothing comes back but whether it
+// was done.
+func tellAgent(ctx context.Context, path string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://agent"+path, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := client().Do(req)
+	if err != nil {
+		return errors.New(friendly(err))
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("the agent answered %s", resp.Status)
+	}
+	return nil
 }
 
 // friendly turns a dial error into the thing to go and do.

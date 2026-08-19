@@ -79,6 +79,35 @@ func (a *App) Status() Status {
 	return st
 }
 
+// SetConnected takes the tunnels down, or puts them back.
+//
+// The only thing in this window that changes anything. It changes nothing about
+// what this machine is — joining, leaving and which mesh stay on the command
+// line, where there is a credential behind them — and it is not remembered: an
+// agent that restarts comes back connected.
+//
+// The status is pushed immediately rather than waited for on the next tick.
+// Two seconds is nothing to a graph and an eternity to a button.
+func (a *App) SetConnected(on bool) Status {
+	path := "/pause"
+	if on {
+		path = "/resume"
+	}
+	ctx, cancel := context.WithTimeout(a.ctx, 10*time.Second)
+	defer cancel()
+
+	st := Status{}
+	if err := tellAgent(ctx, path); err != nil {
+		st = a.Status()
+		st.Error = err.Error()
+	} else {
+		st = a.Status()
+	}
+	wruntime.EventsEmit(a.ctx, "status", st)
+	a.tray.update(st)
+	return st
+}
+
 // OpenPanel opens the management server in a browser.
 //
 // The address comes from the agent rather than from anything typed here: this
