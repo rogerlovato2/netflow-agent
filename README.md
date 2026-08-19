@@ -10,12 +10,26 @@ through any server.
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/rogerlovato2/netflow-agent/main/scripts/install.sh \
-  | sudo sh -s -- --setup-key <key> --server https://manage.example.com
+curl -fsSL https://raw.githubusercontent.com/rogerlovato2/netflow-agent/main/scripts/install.sh | sudo sh
 ```
 
-Linux and macOS, amd64 and arm64. It needs root: creating a network interface
-and writing a route do.
+That puts the agent on the machine and stops. Linux and macOS, amd64 and arm64,
+picked from `uname`. Root, because /usr/local/bin needs it.
+
+Joining a mesh is the second command, and separate on purpose — the setup key
+is a credential, and a credential in a pipeline is a credential in the shell
+history of every machine it was used on:
+
+```bash
+sudo nfagent install --setup-key <key> --server https://manage.example.com
+```
+
+That enrols, installs a service and starts it. Both steps at once, when the
+history does not matter:
+
+```bash
+curl -fsSL … | sudo sh -s -- --setup-key <key> --server https://manage.example.com
+```
 
 | Command | |
 |---|---|

@@ -1,58 +1,149 @@
 #!/bin/sh
-# Installs the netflow agent and joins this machine to a mesh.
+# Puts the netflow agent on this machine.
 #
-#   curl -fsSL https://example.com/install.sh | sudo sh -s -- \
-#     --setup-key <key> --server https://manage.example.com
+#   curl -fsSL https://raw.githubusercontent.com/rogerlovato2/netflow-agent/main/scripts/install.sh | sudo sh
 #
-# What it does, in order: work out which build this machine needs, fetch it,
-# hand it to `nfagent install`, and let that do the rest. Everything specific to
-# an operating system — where the service file goes, how it is enabled, what it
-# is called — lives in the binary rather than here, because a shell script is
-# the worst place to keep knowledge that has to stay correct on three platforms.
+# It installs the program and stops there. Joining a mesh is a separate command
+# with a setup key in it, and the two are separate on purpose: the key is a
+# credential, and a credential typed into a pipeline is a credential in the
+# shell history of every machine it was used on.
+#
+# Everything specific to an operating system — where the service file goes, how
+# it is enabled, what it is called — lives in the binary and not here. A shell
+# script is the worst place to keep knowledge that has to stay correct on three
+# platforms.
+#
+# It can do the second step too, if asked:
+#
+#   … | sudo sh -s -- --setup-key <key> --server https://manage.example.com
+#
+# Arguments are passed straight through to `nfagent install`, so they mean here
+# exactly what they mean there.
 set -eu
 
 REPO="rogerlovato2/netflow-agent"
 VERSION="${NETFLOW_VERSION:-latest}"
-BIN_URL="${NETFLOW_BIN_URL:-}"
+BINDIR="${NETFLOW_BINDIR:-/usr/local/bin}"
+TARGET="$BINDIR/nfagent"
 
-die() { echo "error: $*" >&2; exit 1; }
+say() { echo "$*"; }
+die() {
+	echo "error: $*" >&2
+	exit 1
+}
 
-[ "$(id -u)" = "0" ] || die "run this with sudo: it creates a network interface and installs a service"
+# Root is needed to write to /usr/local/bin and for nothing else here, so the
+# test is whether the directory can be written rather than who is running. That
+# is also what makes NETFLOW_BINDIR=~/bin work without sudo.
+if [ ! -d "$BINDIR" ] || [ ! -w "$BINDIR" ]; then
+	[ "$(id -u)" = "0" ] || die "cannot write to $BINDIR; run this as root:
+  curl -fsSL https://raw.githubusercontent.com/$REPO/main/scripts/install.sh | sudo sh"
+fi
+
+# --- which build this machine needs ------------------------------------------
 
 os=$(uname -s | tr '[:upper:]' '[:lower:]')
+case "$os" in
+	linux | darwin) ;;
+	*) die "unsupported system: $os (this agent runs on Linux and macOS)" ;;
+esac
+
 arch=$(uname -m)
 case "$arch" in
-  x86_64|amd64) arch=amd64 ;;
-  aarch64|arm64) arch=arm64 ;;
-  *) die "unsupported architecture: $arch" ;;
+	x86_64 | amd64) arch=amd64 ;;
+	aarch64 | arm64) arch=arm64 ;;
+	*) die "unsupported architecture: $arch" ;;
 esac
-case "$os" in
-  linux|darwin) ;;
-  *) die "unsupported system: $os" ;;
-esac
+
+asset="nfagent-$os-$arch"
+if [ "$VERSION" = "latest" ]; then
+	base="https://github.com/$REPO/releases/latest/download"
+else
+	base="https://github.com/$REPO/releases/download/$VERSION"
+fi
+
+# --- fetching ----------------------------------------------------------------
+
+if command -v curl >/dev/null 2>&1; then
+	fetch() { curl -fsSL "$1" -o "$2"; }
+elif command -v wget >/dev/null 2>&1; then
+	fetch() { wget -qO "$2" "$1"; }
+else
+	die "neither curl nor wget is available"
+fi
 
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
-if [ -n "$BIN_URL" ]; then
-  url="$BIN_URL"
-elif [ "$VERSION" = "latest" ]; then
-  url="https://github.com/$REPO/releases/latest/download/nfagent-$os-$arch"
-else
-  url="https://github.com/$REPO/releases/download/$VERSION/nfagent-$os-$arch"
+say "fetching $asset ($VERSION)"
+fetch "$base/$asset" "$tmp/nfagent" || die "could not download $base/$asset"
+
+# The digest is published beside the binary and checked here.
+#
+# It proves the download arrived intact, and nothing more: both files come from
+# the same place, so anyone who could replace one could replace the other. The
+# signature that does prove authorship is what the agent checks before it
+# replaces itself — see `nfagent` and the release's SHA256SUMS.sig.
+if fetch "$base/SHA256SUMS" "$tmp/SHA256SUMS" 2>/dev/null; then
+	want=$(grep " $asset\$" "$tmp/SHA256SUMS" | awk '{print $1}')
+	if [ -n "$want" ]; then
+		if command -v sha256sum >/dev/null 2>&1; then
+			got=$(sha256sum "$tmp/nfagent" | awk '{print $1}')
+		elif command -v shasum >/dev/null 2>&1; then
+			got=$(shasum -a 256 "$tmp/nfagent" | awk '{print $1}')
+		else
+			got=""
+		fi
+		if [ -n "$got" ] && [ "$got" != "$want" ]; then
+			die "the download does not match its published digest
+  expected $want
+  got      $got"
+		fi
+		[ -n "$got" ] && say "digest ok"
+	fi
 fi
 
-echo "fetching $url"
-if command -v curl >/dev/null 2>&1; then
-  curl -fsSL "$url" -o "$tmp/nfagent" || die "could not download the agent from $url"
-elif command -v wget >/dev/null 2>&1; then
-  wget -qO "$tmp/nfagent" "$url" || die "could not download the agent from $url"
-else
-  die "neither curl nor wget is available"
-fi
-chmod +x "$tmp/nfagent"
+chmod 0755 "$tmp/nfagent"
+"$tmp/nfagent" version >/dev/null 2>&1 ||
+	die "the downloaded file does not run on this machine"
 
-# The binary copies itself into place, writes the service and starts it. Every
-# argument given to this script is passed straight through, so --setup-key,
-# --server and --name mean here exactly what they mean there.
-exec "$tmp/nfagent" install "$@"
+# --- installing --------------------------------------------------------------
+
+was=""
+if [ -x "$TARGET" ]; then
+	was=$("$TARGET" version 2>/dev/null || echo "unknown")
+fi
+
+mkdir -p "$BINDIR"
+# Written beside and renamed: replacing a running binary in place fails with
+# "text file busy", and reinstalling over a running service is exactly when
+# that happens. The rename is atomic, so there is no moment at which the path
+# holds half a program.
+cp "$tmp/nfagent" "$TARGET.new"
+chmod 0755 "$TARGET.new"
+mv "$TARGET.new" "$TARGET"
+
+now=$("$TARGET" version 2>/dev/null || echo "unknown")
+if [ -n "$was" ] && [ "$was" != "$now" ]; then
+	say "installed $TARGET ($was -> $now)"
+else
+	say "installed $TARGET ($now)"
+fi
+
+# --- joining, only if asked --------------------------------------------------
+
+if [ "$#" -gt 0 ]; then
+	say ""
+	exec "$TARGET" install "$@"
+fi
+
+cat <<EOF
+
+The agent is installed and is not on any mesh yet. To join one, create a setup
+key in the panel and run:
+
+  sudo nfagent install --setup-key <key> --server https://manage.example.com
+
+That enrols this machine, installs a service and starts it. After that,
+\`nfagent status\` says what it sees.
+EOF
