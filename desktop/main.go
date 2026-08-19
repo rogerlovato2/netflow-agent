@@ -42,7 +42,12 @@ func main() {
 		// other one on the way.
 		BackgroundColour: &options.RGBA{R: 0, G: 0, B: 0, A: 0},
 		OnStartup:        app.startup,
+		OnShutdown:       app.shutdown,
 		Bind:             []any{app},
+		// Closing the window puts it away rather than ending the program: the
+		// menu bar item is the part that stays, and quitting from a red button
+		// would take away the thing somebody keeps this open for.
+		HideWindowOnClose: true,
 		Mac: &mac.Options{
 			// The traffic lights sit inside the page rather than on a bar above
 			// it: there is no menu in this window worth a strip of chrome.

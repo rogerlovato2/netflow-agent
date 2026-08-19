@@ -6,6 +6,7 @@ import (
 	"runtime"
 	"time"
 
+	"fyne.io/systray"
 	wruntime "github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
@@ -18,17 +19,34 @@ var version = "dev"
 // worth the name: the agent has all of it, and anything cached here would be a
 // second copy to be wrong.
 type App struct {
-	ctx context.Context
+	ctx  context.Context
+	tray *tray
+	// endTray takes the menu bar item down. Without it the icon outlives the
+	// process by a few seconds, which looks like an application that did not
+	// really quit.
+	endTray func()
 }
 
 func NewApp() *App { return &App{} }
 
 func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
+
+	// The menu bar item, sharing this process rather than being one of its
+	// own. systray is told not to take the application over: it builds a status
+	// item and leaves the event loop, the delegate and the window to wails.
+	a.tray = &tray{app: a}
+	start, end := systray.RunWithExternalLoop(a.tray.build, nil)
+	a.endTray = end
+	onMainThread(start)
+
 	// The page asks for status when it wants it, and this pushes one every two
 	// seconds so it does not have to poll on a timer of its own. Two seconds is
 	// faster than anything actually changes — which is the right speed for a
 	// window somebody opens because they already suspect something is wrong.
+	//
+	// The menu bar is fed from the same tick, so the corner of the screen and
+	// the window can never be showing two different answers.
 	go func() {
 		t := time.NewTicker(2 * time.Second)
 		defer t.Stop()
@@ -37,10 +55,19 @@ func (a *App) startup(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				wruntime.EventsEmit(ctx, "status", a.Status())
+				st := a.Status()
+				wruntime.EventsEmit(ctx, "status", st)
+				a.tray.update(st)
 			}
 		}
 	}()
+}
+
+// shutdown is wails' way out. Returning false lets it close.
+func (a *App) shutdown(context.Context) {
+	if a.endTray != nil {
+		a.endTray()
+	}
 }
 
 // Status is what the agent says about itself, or why it said nothing.

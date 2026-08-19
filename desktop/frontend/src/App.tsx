@@ -2,6 +2,8 @@ import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { EventsOn } from '../wailsjs/runtime/runtime'
 import { Copy, Fit, OpenLog, OpenPanel, Status } from '../wailsjs/go/main/App'
 import type { main } from '../wailsjs/go/models'
+import { Traffic, useTraffic } from './Traffic'
+import { ago, compareAddresses, duration, size } from './format'
 
 /**
  * The window.
@@ -10,11 +12,13 @@ import type { main } from '../wailsjs/go/models'
  * to whom, and how. Everything else here is a consequence of one of those —
  * the address to copy, the log to open when the answer is no.
  *
- * It holds no state of its own beyond what it was last told. The agent has all
- * of it, and a second copy here would be a second thing that can be wrong.
+ * It holds no state of its own beyond what it was last told and what the person
+ * looking at it has chosen to open or sort. The agent has the rest, and a
+ * second copy here would be a second thing that can be wrong.
  */
 export function App() {
   const [status, setStatus] = useState<main.Status | null>(null)
+  const traffic = useTraffic(status)
 
   useEffect(() => {
     // Asked once so the window is not blank for two seconds, then pushed by the
@@ -29,7 +33,7 @@ export function App() {
       {status === null ? (
         <Waiting />
       ) : status.reachable ? (
-        <Connected status={status} />
+        <Connected status={status} traffic={traffic} />
       ) : (
         <Unreachable reason={status.error} />
       )}
@@ -41,9 +45,9 @@ export function App() {
  * Everything, measured.
  *
  * The window is as tall as this is and no taller, so a machine with two peers
- * gets a small window and one with twenty gets a bigger one, without either
- * being a guess made when the frame was created. The list inside has a maximum
- * of its own; past that the window stops growing and the list scrolls.
+ * gets a small window and one with twenty gets a bigger one, rather than a
+ * frame guessed when it was created. The list inside has a maximum of its own;
+ * past that the window stops growing and the list scrolls.
  */
 function Sized({ children }: { children: React.ReactNode }) {
   const ref = useRef<HTMLDivElement>(null)
@@ -103,43 +107,31 @@ function Unreachable({ reason }: { reason?: string }) {
   )
 }
 
-function Connected({ status }: { status: main.Status }) {
-  const peers = status.peers ?? []
-  const up = peers.filter((p) => p.state === 'connected').length
-
+function Connected({
+  status,
+  traffic,
+}: {
+  status: main.Status
+  traffic: ReturnType<typeof useTraffic>
+}) {
   return (
     <>
-      <Head status={status} up={up} total={peers.length} />
-
-      <div
-        className="scroll"
-        style={{ maxHeight: 420, overflowY: 'auto', padding: '0 16px 16px' }}
-      >
-        {peers.length === 0 ? (
-          <p className="card" style={{ padding: 16, color: 'var(--text-faint)', fontSize: 12, lineHeight: 1.5 }}>
-            No other machine is in this one's map. If that is unexpected, it is a
-            policy that reaches nobody — or this machine is still waiting to be
-            approved.
-          </p>
-        ) : (
-          <div className="card" style={{ overflow: 'hidden' }}>
-            {peers.map((p, i) => (
-              <PeerRow key={p.publicKey} peer={p} first={i === 0} />
-            ))}
-          </div>
-        )}
-      </div>
-
+      <Head status={status} />
+      <Traffic {...traffic} />
+      <Machines peers={status.peers ?? []} />
       <Foot status={status} />
     </>
   )
 }
 
 /** The answer to "am I connected", in the largest thing on the screen. */
-function Head({ status, up, total }: { status: main.Status; up: number; total: number }) {
+function Head({ status }: { status: main.Status }) {
   const live = status.signalConnected
+  const peers = status.peers ?? []
+  const up = peers.filter(connected).length
+
   return (
-    <div style={{ padding: '4px 16px 16px' }}>
+    <div style={{ padding: '4px 16px 14px' }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
         <span className={live ? 'dot dot-on' : 'dot dot-off'} />
         <span style={{ fontSize: 15, fontWeight: 500 }}>
@@ -151,13 +143,14 @@ function Head({ status, up, total }: { status: main.Status; up: number; total: n
 
       <div style={{ marginTop: 8, display: 'flex', gap: 6, flexWrap: 'wrap' }}>
         <span className="chip" style={{ color: 'var(--text-dim)' }}>
-          {up}/{total} {total === 1 ? 'tunnel' : 'tunnels'}
+          {up}/{peers.length} {peers.length === 1 ? 'tunnel' : 'tunnels'}
         </span>
         {status.interface && (
           <span className="chip" style={{ color: 'var(--text-faint)' }}>
             {status.interface}
           </span>
         )}
+        <Uptime since={status.startedAt} />
         {/* A configured relay is the ordinary case and says nothing worth a
             chip. Its absence is what somebody would want to know: it is the
             difference between "some peer will not connect" and "all of them
@@ -169,6 +162,30 @@ function Head({ status, up, total }: { status: main.Status; up: number; total: n
         )}
       </div>
     </div>
+  )
+}
+
+/**
+ * How long the agent has been up.
+ *
+ * The agent restarts itself to apply some changes from the server, so this is
+ * not how long the machine has been on the mesh — and that is the point. A
+ * number that resets is a number worth seeing reset.
+ */
+function Uptime({ since }: { since: number }) {
+  // Its own clock: the status arrives every two seconds and this would
+  // otherwise tick in the same jumps, which reads as a stuck number.
+  const [, redraw] = useState(0)
+  useEffect(() => {
+    const t = setInterval(() => redraw((n) => n + 1), 1000)
+    return () => clearInterval(t)
+  }, [])
+
+  if (!since) return null
+  return (
+    <span className="chip" style={{ color: 'var(--text-faint)' }} title="since the agent started">
+      up {duration(Date.now() / 1000 - since)}
+    </span>
   )
 }
 
@@ -212,62 +229,223 @@ function Address({ value }: { value: string }) {
   )
 }
 
+type Sort = 'address' | 'name'
+
 /**
- * One peer.
+ * The machines this one may reach.
  *
- * The state and the path are the two things worth seeing at a glance: a tunnel
- * that works can be direct or through a relay, and from a status line they look
- * identical while costing very different things.
+ * Folded away by default is wrong for a list of two and right for a list of
+ * fifty, so the choice is remembered rather than decided here. So is the
+ * order: by address, because that is where a machine is and it does not move
+ * when somebody renames it — but by name for anybody who thinks in names.
+ */
+function Machines({ peers }: { peers: main.Peer[] }) {
+  const [open, setOpen] = useStored('machines.open', true)
+  const [sort, setSort] = useStored<Sort>('machines.sort', 'address')
+
+  const sorted = [...peers].sort((a, b) =>
+    sort === 'name'
+      ? (a.name || a.publicKey).localeCompare(b.name || b.publicKey)
+      : compareAddresses(a.address, b.address),
+  )
+
+  return (
+    <div style={{ padding: '0 16px 14px' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
+        <button
+          onClick={() => setOpen(!open)}
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: 6,
+            fontSize: 12,
+            color: 'var(--text-dim)',
+          }}
+        >
+          <span
+            style={{
+              display: 'inline-block',
+              transform: open ? 'rotate(90deg)' : 'none',
+              transition: 'transform 120ms ease',
+              fontSize: 9,
+            }}
+          >
+            ▶
+          </span>
+          Machines ({peers.length})
+        </button>
+
+        <span style={{ flex: 1 }} />
+
+        {peers.length > 1 && (
+          <span style={{ display: 'flex', gap: 2 }}>
+            <Toggle on={sort === 'address'} onClick={() => setSort('address')}>
+              address
+            </Toggle>
+            <Toggle on={sort === 'name'} onClick={() => setSort('name')}>
+              name
+            </Toggle>
+          </span>
+        )}
+      </div>
+
+      {open &&
+        (peers.length === 0 ? (
+          <p
+            className="card"
+            style={{ padding: 14, color: 'var(--text-faint)', fontSize: 12, lineHeight: 1.5 }}
+          >
+            No other machine is in this one's map. If that is unexpected, it is a
+            policy that reaches nobody — or this machine is still waiting to be
+            approved.
+          </p>
+        ) : (
+          <div className="card scroll" style={{ maxHeight: 300, overflowY: 'auto' }}>
+            {sorted.map((p, i) => (
+              <PeerRow key={p.publicKey} peer={p} first={i === 0} />
+            ))}
+          </div>
+        ))}
+    </div>
+  )
+}
+
+function Toggle({
+  on,
+  onClick,
+  children,
+}: {
+  on: boolean
+  onClick: () => void
+  children: React.ReactNode
+}) {
+  return (
+    <button
+      onClick={onClick}
+      className="chip"
+      style={{
+        color: on ? 'var(--text)' : 'var(--text-faint)',
+        borderColor: on ? 'var(--border-strong)' : 'transparent',
+        background: on ? 'var(--bg-panel)' : 'transparent',
+      }}
+    >
+      {children}
+    </button>
+  )
+}
+
+/**
+ * One machine, and everything about it when asked.
+ *
+ * The row is what somebody scans; the detail underneath is what they open when
+ * one row is the reason they came. Keeping it collapsed is not about space — it
+ * is that a key and a byte count are never the answer to "is it working".
  */
 function PeerRow({ peer, first }: { peer: main.Peer; first: boolean }) {
-  const connected = peer.state === 'connected'
+  const [open, setOpen] = useState(false)
+  const live = connected(peer)
   const relayed = peer.path === 'relay'
 
   return (
-    <div
-      className="row"
-      style={{
-        display: 'flex',
-        alignItems: 'center',
-        gap: 10,
-        padding: '9px 12px',
-        borderTop: first ? 'none' : '1px solid var(--border)',
-      }}
-    >
-      <span className={connected ? 'dot dot-on' : 'dot dot-off'} />
-      <div style={{ minWidth: 0, flex: 1 }}>
-        <div style={{ whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-          {peer.name || peer.publicKey.slice(0, 10)}
+    <div style={{ borderTop: first ? 'none' : '1px solid var(--border)' }}>
+      <button
+        className="row"
+        onClick={() => setOpen(!open)}
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: 10,
+          padding: '9px 12px',
+          width: '100%',
+          textAlign: 'left',
+        }}
+      >
+        <span className={live ? 'dot dot-on' : 'dot dot-off'} />
+        <div style={{ minWidth: 0, flex: 1 }}>
+          <div style={{ whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+            {peer.name || peer.publicKey.slice(0, 10)}
+          </div>
+          <div className="mono" style={{ fontSize: 11, color: 'var(--text-faint)' }}>
+            {peer.address || peer.publicKey.slice(0, 16)}
+          </div>
         </div>
-        <div className="mono" style={{ fontSize: 11, color: 'var(--text-faint)' }}>
-          {peer.address || peer.publicKey.slice(0, 16)}
-        </div>
-      </div>
 
-      {connected ? (
-        <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-          {relayed && (
-            <span className="chip" style={{ color: 'var(--warn)' }}>
-              relay
-            </span>
-          )}
-          {peer.rttMs > 0 && (
-            <span className="mono" style={{ fontSize: 11, color: 'var(--text-dim)' }}>
-              {peer.rttMs} ms
-            </span>
-          )}
-        </span>
-      ) : (
-        <span style={{ fontSize: 11, color: 'var(--text-faint)' }}>{state(peer.state)}</span>
+        {live ? (
+          <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+            {relayed && (
+              <span className="chip" style={{ color: 'var(--warn)' }}>
+                relay
+              </span>
+            )}
+            {peer.rttMs > 0 && (
+              <span className="mono" style={{ fontSize: 11, color: 'var(--text-dim)' }}>
+                {peer.rttMs} ms
+              </span>
+            )}
+          </span>
+        ) : (
+          <span style={{ fontSize: 11, color: 'var(--text-faint)' }}>{state(peer.state)}</span>
+        )}
+      </button>
+
+      {open && (
+        <dl
+          style={{
+            display: 'grid',
+            gridTemplateColumns: 'auto 1fr',
+            gap: '4px 12px',
+            padding: '2px 12px 12px 32px',
+            fontSize: 11,
+          }}
+        >
+          <Detail label="path">{peer.path || 'none yet'}</Detail>
+          <Detail label="handshake">{ago(peer.handshake)}</Detail>
+          <Detail label="traffic">
+            {size(peer.rx)} in · {size(peer.tx)} out
+          </Detail>
+          <Detail label="key" mono>
+            {peer.publicKey}
+          </Detail>
+        </dl>
       )}
     </div>
   )
+}
+
+function Detail({
+  label,
+  mono,
+  children,
+}: {
+  label: string
+  mono?: boolean
+  children: React.ReactNode
+}) {
+  return (
+    <>
+      <dt style={{ color: 'var(--text-faint)' }}>{label}</dt>
+      <dd
+        className={mono ? 'mono' : undefined}
+        style={{ color: 'var(--text-dim)', wordBreak: 'break-all' }}
+      >
+        {children}
+      </dd>
+    </>
+  )
+}
+
+function connected(p: main.Peer): boolean {
+  return p.state === 'connected' && p.handshake > 0
 }
 
 function state(s: string): string {
   switch (s) {
     case 'negotiating':
       return 'negotiating'
+    case 'connected':
+      // A path exists and WireGuard has not agreed keys over it. Calling that
+      // connected is what sends somebody looking in the wrong place.
+      return 'no handshake'
     case 'failed':
       return 'failed'
     case 'closed':
@@ -289,7 +467,12 @@ function Foot({ status }: { status: main.Status }) {
         borderTop: '1px solid var(--border)',
       }}
     >
-      <span style={{ fontSize: 11, color: 'var(--text-faint)' }}>{status.version}</span>
+      <span
+        style={{ fontSize: 11, color: 'var(--text-faint)' }}
+        title={`window ${status.version}, agent ${status.agentVersion || 'unknown'}`}
+      >
+        {status.agentVersion || status.version}
+      </span>
       <span style={{ display: 'flex', gap: 6 }}>
         <button className="action" onClick={() => void OpenLog()}>
           Log
@@ -302,4 +485,32 @@ function Foot({ status }: { status: main.Status }) {
       </span>
     </div>
   )
+}
+
+/**
+ * A preference that survives the window being closed.
+ *
+ * Not sent to the agent: how somebody likes their list sorted is theirs and
+ * this machine's, and putting it on the mesh would make it everybody's.
+ */
+function useStored<T>(key: string, fallback: T): [T, (v: T) => void] {
+  const [value, setValue] = useState<T>(() => {
+    try {
+      const raw = localStorage.getItem(key)
+      return raw === null ? fallback : (JSON.parse(raw) as T)
+    } catch {
+      return fallback
+    }
+  })
+  return [
+    value,
+    (v: T) => {
+      setValue(v)
+      try {
+        localStorage.setItem(key, JSON.stringify(v))
+      } catch {
+        // A window that cannot remember a preference still works.
+      }
+    },
+  ]
 }

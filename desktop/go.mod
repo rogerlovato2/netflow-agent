@@ -3,6 +3,7 @@ module github.com/rogerlovato2/netflow-agent/desktop
 go 1.25.0
 
 require (
+	fyne.io/systray v1.12.2
 	github.com/Microsoft/go-winio v0.6.2
 	github.com/wailsapp/wails/v2 v2.15.0
 )

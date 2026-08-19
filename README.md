@@ -29,8 +29,7 @@ and writing a route do.
 | | |
 |---|---|
 | `nfagent` | the client: one interface, one tunnel per peer |
-| `nfui` | a macOS menu bar item that reads the agent and changes nothing |
-| `desktop` | the window: the same, with room to show who the peers are |
+| `desktop` | the window and the menu bar item: reads the agent, changes nothing |
 | `nfsignal` | where machines meet before there is a path between them |
 | `nfrelay` | carries the pairs that have no direct path |
 
@@ -87,9 +86,6 @@ go test ./...
 The tests need neither root nor the internet: they bring up two real engines, a
 real signalling server, real ICE and real WireGuard, and push a TCP conversation
 through the tunnel — in userspace, over loopback.
-
-`nfui` is built on the machine it runs on. systray talks to the platform's own
-toolkit through cgo, and a cross build links happily and then shows no icon.
 
 The window is a separate Go module under `desktop`, built with
 [wails](https://wails.io): Go on one side, a web view on the other, and no

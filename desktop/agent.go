@@ -25,6 +25,12 @@ type Status struct {
 	Signal    bool   `json:"signalConnected"`
 	Relay     bool   `json:"relayConfigured"`
 	Peers     []Peer `json:"peers"`
+	// StartedAt is when the agent came up, in unix seconds. It resets when the
+	// agent restarts, which is the honest thing for it to do.
+	StartedAt int64 `json:"startedAt"`
+	// AgentVersion is the agent's, which is not this program's. They are
+	// updated separately and will disagree.
+	AgentVersion string `json:"agentVersion"`
 
 	// Reachable is this program's own reading, not the agent's: it is false
 	// when there was nobody to ask.

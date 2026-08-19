@@ -69,12 +69,9 @@ jobs:
           go run ./cmd/nfsign sign dist/SHA256SUMS
           ls -la dist/SHA256SUMS.sig
 
-      # The menu bar client is built on the machine it runs on, not cross
-      # compiled. systray needs cgo and the platform's own toolkit — Cocoa here,
-      # GTK on Linux — and a cross build silently produces something that links
-      # and shows no icon.
-      - name: Note about the graphical client
-        run: echo "nfui is built per-platform; see the release notes"
+      # The window is not here. It needs cgo and the platform's own web view,
+      # so it is built on the machine it runs on by release-ui.yml, which
+      # attaches its bundle to this same release.
 
       - uses: softprops/action-gh-release@v2
         with:

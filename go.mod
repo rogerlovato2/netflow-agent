@@ -3,7 +3,6 @@ module github.com/rogerlovato2/netflow-agent
 go 1.26.5
 
 require (
-	fyne.io/systray v1.12.2
 	github.com/coder/websocket v1.8.15
 	github.com/pion/ice/v4 v4.4.1
 	github.com/pion/logging v0.2.4
@@ -15,7 +14,6 @@ require (
 )
 
 require (
-	github.com/godbus/dbus/v5 v5.1.0 // indirect
 	github.com/google/btree v1.1.2 // indirect
 	github.com/google/go-cmp v0.7.0 // indirect
 	github.com/google/uuid v1.6.0 // indirect

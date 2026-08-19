@@ -86,6 +86,16 @@ type ControlStatus struct {
 	Signal    bool          `json:"signalConnected"`
 	Relay     bool          `json:"relayConfigured"`
 	Peers     []ControlPeer `json:"peers"`
+	// StartedAt is when this agent came up, in unix seconds.
+	//
+	// The agent restarts itself to apply some changes from the server, so this
+	// is not the same as how long the machine has been on the mesh — which is
+	// the more honest thing to show: a number that resets when something went
+	// wrong is a number worth seeing reset.
+	StartedAt int64 `json:"startedAt"`
+	// Version is the agent's, which is not the window's. Two programs updated
+	// separately will disagree, and the one that matters for a tunnel is this.
+	Version string `json:"agentVersion"`
 }
 
 // ControlPeer is one peer, as the agent sees it right now.
@@ -167,8 +177,13 @@ func serveControl(ctx context.Context, eng *engine.Engine, cfg *Config, log *slo
 	}
 }
 
+// startedAt is when this process came up. Set once, read by the control socket.
+var startedAt = time.Now()
+
 func collectControlStatus(eng *engine.Engine, cfg *Config) ControlStatus {
 	st := ControlStatus{
+		StartedAt: startedAt.Unix(),
+		Version:   version,
 		Address:   cfg.Address,
 		Interface: eng.Device().Name(),
 		PublicKey: eng.PublicKey().String(),

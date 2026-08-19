@@ -1,14 +1,16 @@
 name: release-ui
 
-# The menu bar client, built on macOS because it has to be.
+# The window, built on macOS because it has to be.
 #
-# systray talks to Cocoa through cgo, so this cannot be cross compiled from the
-# Linux runner that builds everything else: the cross build links and produces a
-# binary that shows no icon and reports no error, which is the worst of both.
+# wails links against the system's web view through cgo, so this cannot be
+# cross compiled from the Linux runner that builds everything else: the cross
+# build links and produces a binary that opens nothing and reports no error,
+# which is the worst of both.
 #
 # What is still missing before this is something a person can just download:
-# signing and notarisation. macOS refuses an unsigned application downloaded
-# from the internet, and the certificate is an Apple developer account.
+# signing and notarisation. The bundle below is signed by nobody, and macOS
+# refuses an unsigned application that arrived from the internet more firmly
+# than one built on the machine. The certificate is an Apple developer account.
 on:
   push:
     tags: ['v*']
@@ -26,15 +28,30 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
       - name: Build
+        working-directory: desktop
         run: |
           set -eu
-          mkdir -p dist
-          for arch in amd64 arm64; do
-            CGO_ENABLED=1 GOOS=darwin GOARCH=$arch \
-              go build -trimpath -ldflags="-s -w" -o "dist/nfui-darwin-$arch" ./cmd/nfui
-          done
-          cd dist && shasum -a 256 * > SHA256SUMS-ui && cat SHA256SUMS-ui
+          go install github.com/wailsapp/wails/v2/cmd/wails@v2.15.0
+          # Both architectures in one bundle: a universal binary is the only
+          # form somebody can be handed without being asked which Mac they have.
+          wails build -platform darwin/universal \
+            -ldflags "-X main.version=${GITHUB_REF_NAME}"
+          # Signed here rather than by wails, which cannot sign a bundle that
+          # carries extended attributes it did not put there.
+          xattr -cr build/bin/netflow.app
+          codesign --force --deep --sign - build/bin/netflow.app
+          ditto -c -k --keepParent build/bin/netflow.app netflow-macos.zip
+          shasum -a 256 netflow-macos.zip > SHA256SUMS-ui
+          cat SHA256SUMS-ui
       - uses: softprops/action-gh-release@v2
         with:
-          files: dist/*
+          files: |
+            desktop/netflow-macos.zip
+            desktop/SHA256SUMS-ui
