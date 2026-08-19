@@ -41,17 +41,12 @@ jobs:
           go install github.com/wailsapp/wails/v2/cmd/wails@v2.15.0
           # Both architectures in one bundle: a universal binary is the only
           # form somebody can be handed without being asked which Mac they have.
-          wails build -platform darwin/universal \
-            -ldflags "-X main.version=${GITHUB_REF_NAME}"
-          # Signed here rather than by wails, which cannot sign a bundle that
-          # carries extended attributes it did not put there.
-          xattr -cr build/bin/netflow.app
-          codesign --force --deep --sign - build/bin/netflow.app
-          ditto -c -k --keepParent build/bin/netflow.app netflow-macos.zip
-          shasum -a 256 netflow-macos.zip > SHA256SUMS-ui
+          make dmg VERSION="${GITHUB_REF_NAME}" WAILS_PLATFORM=darwin/universal
+          mv build/bin/*.dmg netflow-macos.dmg
+          shasum -a 256 netflow-macos.dmg > SHA256SUMS-ui
           cat SHA256SUMS-ui
       - uses: softprops/action-gh-release@v2
         with:
           files: |
-            desktop/netflow-macos.zip
+            desktop/netflow-macos.dmg
             desktop/SHA256SUMS-ui
