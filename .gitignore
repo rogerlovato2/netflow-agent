@@ -17,3 +17,10 @@ docker/.env
 # macOS
 .DS_Store
 ._*
+
+# The window's build output: the bundle, and the frontend it embeds.
+desktop/build/bin/
+desktop/frontend/dist/
+desktop/frontend/node_modules/
+# Generated from the Go side on every build, and wrong the moment it is stale.
+desktop/frontend/wailsjs/

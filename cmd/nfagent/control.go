@@ -4,12 +4,15 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
 	"os"
+	"os/user"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"time"
 
 	"github.com/rogerlovato2/netflow-agent/internal/engine"
@@ -34,6 +37,45 @@ func controlSocket() string {
 	}
 }
 
+// giveToClients hands the socket to the group that may read it.
+//
+// The group differs by system because the question does: macOS puts every human
+// account in staff and its service accounts elsewhere, which is exactly the line
+// worth drawing. Linux has no such group by convention, so the installer makes
+// one, and if it is not there the socket stays root-only rather than being
+// opened to everything on the machine.
+func giveToClients(path string) error {
+	name := clientGroup()
+	if name == "" {
+		return nil
+	}
+	g, err := user.LookupGroup(name)
+	if err != nil {
+		return fmt.Errorf("looking up the %s group: %w", name, err)
+	}
+	gid, err := strconv.Atoi(g.Gid)
+	if err != nil {
+		return fmt.Errorf("the %s group has an unusable id %q: %w", name, g.Gid, err)
+	}
+	// -1 leaves the owner alone: the agent owns the socket and should keep it.
+	if err := os.Chown(path, -1, gid); err != nil {
+		return fmt.Errorf("giving the socket to %s: %w", name, err)
+	}
+	return nil
+}
+
+func clientGroup() string {
+	switch runtime.GOOS {
+	case "darwin":
+		return "staff"
+	case "windows":
+		// A named pipe is not a file and its permissions are not a mode.
+		return ""
+	default:
+		return "netflow"
+	}
+}
+
 // ControlStatus is what a running agent says about itself.
 type ControlStatus struct {
 	Address   string        `json:"address"`
@@ -49,6 +91,11 @@ type ControlStatus struct {
 // ControlPeer is one peer, as the agent sees it right now.
 type ControlPeer struct {
 	PublicKey string `json:"publicKey"`
+	// Name and Address come from the map rather than from the tunnel: the
+	// device knows keys and prefixes, and a person reading a window knows
+	// neither.
+	Name    string `json:"name,omitempty"`
+	Address string `json:"address,omitempty"`
 	State     string `json:"state"`
 	Path      string `json:"path"`
 	RTTMillis int    `json:"rttMs"`
@@ -85,8 +132,20 @@ func serveControl(ctx context.Context, eng *engine.Engine, cfg *Config, log *slo
 	// who lands on the machine as a service account may not. Nothing here is a
 	// secret, but who talks to whom is worth keeping to the people who are
 	// already meant to know.
+	//
+	// 0660 alone would mean root and nobody else, since that is who the agent
+	// runs as. The group is what makes the mode useful: give the socket away to
+	// the group the machine's human accounts are in, and the window a person
+	// opens can read it without any of them being root.
 	if err := os.Chmod(path, 0o660); err != nil {
 		log.Debug("control: could not set the socket mode", "err", err)
+	}
+	if err := giveToClients(path); err != nil {
+		// Not fatal. The agent's own job is unaffected; what is lost is the
+		// graphical client, and saying so here is the only warning anybody
+		// will get before it says it cannot talk to the agent.
+		log.Warn("control: the socket stays root-only; a client running as a "+
+			"user will not be able to read it", "err", err)
 	}
 
 	mux := http.NewServeMux()
@@ -126,8 +185,13 @@ func collectControlStatus(eng *engine.Engine, cfg *Config) ControlStatus {
 		id := key.String()
 		path := eng.PeerPath(key)
 		d := dev[id]
+		// What the server last said about this peer, so the list can be read
+		// by somebody who has never seen a public key.
+		known := peerFromMap(id)
 		st.Peers = append(st.Peers, ControlPeer{
 			PublicKey: id,
+			Name:      known.Name,
+			Address:   known.Address,
 			State:     string(eng.PeerState(key)),
 			Path:      path.Kind,
 			RTTMillis: int(path.RTT.Milliseconds()),

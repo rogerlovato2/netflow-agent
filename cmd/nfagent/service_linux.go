@@ -25,6 +25,17 @@ const serviceName = "netflow-agent"
 // address exists, the second only means the stack is loaded, and an agent that
 // starts before it has an address gathers no candidates worth having.
 func writeService(binary string) error {
+	// The group that may read the control socket. Made here because there is no
+	// conventional one to borrow on Linux: a machine's human accounts are not
+	// all in any single group the way they are on macOS, so the choice has to be
+	// made explicitly and an administrator has to put people in it. Until
+	// somebody is added, the socket is root's alone, which is the right default
+	// for a group that means "may see this mesh".
+	if err := sh("groupadd", "-f", "netflow"); err != nil {
+		fmt.Fprintf(os.Stderr, "could not create the netflow group (%v); the "+
+			"control socket will stay root-only\n", err)
+	}
+
 	unit := fmt.Sprintf(`[Unit]
 Description=netflow mesh agent
 Documentation=https://github.com/rogerlovato2/netflow

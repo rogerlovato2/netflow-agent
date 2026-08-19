@@ -150,9 +150,15 @@ func render(st agentStatus, err error, status, address, peers *systray.MenuItem,
 
 // describe is one peer in one line, said the way somebody would ask about it.
 func describe(p agentPeer) string {
-	key := p.PublicKey
-	if len(key) > 8 {
-		key = key[:8]
+	// The name the panel gave it. The key is the fallback and not the default:
+	// eight characters of base64 identify a peer to the machine and to nobody
+	// reading a menu.
+	key := p.Name
+	if key == "" {
+		key = p.PublicKey
+		if len(key) > 8 {
+			key = key[:8]
+		}
 	}
 	switch {
 	case p.State == "connected" && p.Handshake > 0 && p.Path == "relay":

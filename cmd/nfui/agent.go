@@ -25,6 +25,7 @@ type agentStatus struct {
 
 type agentPeer struct {
 	PublicKey string `json:"publicKey"`
+	Name      string `json:"name"`
 	State     string `json:"state"`
 	Path      string `json:"path"`
 	RTTMillis int    `json:"rttMs"`

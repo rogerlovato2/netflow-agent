@@ -155,6 +155,11 @@ type RelayConfig struct {
 type PeerConfig struct {
 	PublicKey  string   `json:"publicKey"`
 	AllowedIPs []string `json:"allowedIPs"`
+	// Name is what the panel calls that machine. Nothing here acts on it — it
+	// exists so a graphical client can say "supabase" where the command line
+	// says a public key, and so the answer comes from the one place that is
+	// allowed to name things.
+	Name string `json:"name,omitempty"`
 	// Address is the peer's own address in the mesh, which is what an access
 	// rule is written against. It is the first of the allowed IPs today, and
 	// carried separately so that stays an implementation detail rather than an

@@ -262,6 +262,34 @@ type updatePolicy struct {
 	Version string `json:"version,omitempty"`
 }
 
+// lastMap is what the most recent network map said about the peers, kept for
+// the control socket to read.
+//
+// A copy rather than a pointer into the config: the config is rewritten by the
+// goroutine that follows the map, and the control socket answers on another.
+var lastMap struct {
+	sync.Mutex
+	byKey map[string]PeerConfig
+}
+
+func setLastMap(peers []PeerConfig) {
+	byKey := make(map[string]PeerConfig, len(peers))
+	for _, p := range peers {
+		byKey[p.PublicKey] = p
+	}
+	lastMap.Lock()
+	defer lastMap.Unlock()
+	lastMap.byKey = byKey
+}
+
+// peerFromMap is what the server last said about one peer. The zero value is
+// the honest answer before the first map arrives.
+func peerFromMap(publicKey string) PeerConfig {
+	lastMap.Lock()
+	defer lastMap.Unlock()
+	return lastMap.byKey[publicKey]
+}
+
 // lastPolicy is what the most recent map said about updates, for the periodic
 // check to read. The map is polled every twenty seconds and the check runs
 // every six hours; without this the check would have to ask the server itself,
@@ -296,6 +324,7 @@ func followTheMap(ctx context.Context, eng *engine.Engine, cfg *Config, path str
 	// Seeded from what was already applied, so an unchanged map after a restart
 	// is not announced as news.
 	last := mapFingerprint(cfg.Peers)
+	setLastMap(cfg.Peers)
 	for {
 		m, err := fetchMap(ctx, cfg)
 		if err != nil {
@@ -403,6 +432,7 @@ func followTheMap(ctx context.Context, eng *engine.Engine, cfg *Config, path str
 				// map, so that what a machine allows and who it talks to can
 				// never be two different versions of the truth.
 				applyAccessRules(eng, m.Peers, log)
+				setLastMap(m.Peers)
 
 				if fingerprint := mapFingerprint(m.Peers); fingerprint != last {
 					log.Info("network map updated", "peers", len(peers))
@@ -474,6 +504,8 @@ func mapFingerprint(peers []PeerConfig) string {
 		b.WriteString(p.PublicKey)
 		b.WriteByte(' ')
 		b.WriteString(strings.Join(p.AllowedIPs, ","))
+		b.WriteByte(' ')
+		b.WriteString(p.Name)
 		b.WriteByte('\n')
 	}
 	return b.String()

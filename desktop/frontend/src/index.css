@@ -1,0 +1,160 @@
+/* The same palette as the panel, so the two do not look like two products.
+   Kept here rather than shared across the repositories on purpose: the panel is
+   a private repository and this one is public, and a shared package between
+   them would tie a release of one to the other for the sake of forty colours. */
+:root {
+  --bg: #07090e;
+  --bg-panel: rgba(148, 163, 184, 0.06);
+  --bg-panel-hover: rgba(148, 163, 184, 0.1);
+  --border: rgba(148, 163, 184, 0.14);
+  --border-strong: rgba(148, 163, 184, 0.26);
+  --text: #e6ebf3;
+  --text-dim: #93a1b5;
+  --text-faint: #64748b;
+  --ok: #34d399;
+  --warn: #fbbf24;
+  --danger: #f87171;
+  --accent: #34d399;
+  --accent-soft: rgba(52, 211, 153, 0.16);
+  color-scheme: dark;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #f6f7fb;
+    --bg-panel: rgba(15, 23, 42, 0.04);
+    --bg-panel-hover: rgba(15, 23, 42, 0.07);
+    --border: rgba(15, 23, 42, 0.1);
+    --border-strong: rgba(15, 23, 42, 0.2);
+    --text: #0f172a;
+    --text-dim: #475569;
+    --text-faint: #64748b;
+    --ok: #059669;
+    --warn: #b45309;
+    --danger: #dc2626;
+    --accent: #059669;
+    --accent-soft: rgba(5, 150, 105, 0.14);
+    color-scheme: light;
+  }
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+/* No fixed height anywhere: the page is as tall as what is in it, and the
+   window follows — see Fit in app.go. Anything stretched to 100% here would
+   make the measurement circular. */
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+  font-size: 13px;
+  -webkit-font-smoothing: antialiased;
+  /* Nothing in this window is selectable by accident: it is a status page, and
+     dragging across it should move the window rather than highlight a word. */
+  user-select: none;
+  cursor: default;
+  overflow: hidden;
+}
+
+/* The strip the traffic lights sit in on macOS. It is empty and draggable —
+   the window has no toolbar worth the name, and a window this size that cannot
+   be moved from its top edge feels broken. */
+.titlebar {
+  height: 38px;
+  --wails-draggable: drag;
+}
+
+.mono {
+  font-family: ui-monospace, 'SF Mono', Menlo, monospace;
+  font-variant-numeric: tabular-nums;
+  user-select: text;
+  cursor: text;
+}
+
+.card {
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+}
+
+.row {
+  transition: background-color 120ms ease;
+}
+.row:hover {
+  background: var(--bg-panel-hover);
+}
+
+button {
+  font: inherit;
+  color: inherit;
+  background: none;
+  border: none;
+  cursor: pointer;
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--bg-panel);
+  font-size: 10.5px;
+  line-height: 18px;
+  white-space: nowrap;
+}
+
+.action {
+  border: 1px solid var(--border);
+  background: var(--bg-panel);
+  border-radius: 9px;
+  padding: 6px 10px;
+  font-size: 12px;
+  color: var(--text-dim);
+  transition:
+    background-color 120ms ease,
+    color 120ms ease;
+}
+.action:hover {
+  background: var(--bg-panel-hover);
+  color: var(--text);
+}
+
+.dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  flex: none;
+}
+.dot-on {
+  background: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+.dot-off {
+  background: var(--text-faint);
+  opacity: 0.6;
+}
+
+@keyframes breathe {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.4;
+  }
+}
+.breathe {
+  animation: breathe 1.6s ease-in-out infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .breathe {
+    animation: none;
+  }
+}

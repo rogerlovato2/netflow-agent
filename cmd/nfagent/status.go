@@ -58,11 +58,17 @@ func printLive(st ControlStatus) error {
 	}
 	fmt.Println()
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "PEER\tSTATE\tPATH\tRTT\tHANDSHAKE\tRX\tTX")
+	fmt.Fprintln(w, "PEER\tADDRESS\tSTATE\tPATH\tRTT\tHANDSHAKE\tRX\tTX")
 	for _, p := range st.Peers {
-		key := p.PublicKey
-		if len(key) > 12 {
-			key = key[:12] + "\u2026"
+		// The name the panel gave it, and the key when the agent has not seen a
+		// map yet. A truncated key identifies a peer to the machine and to
+		// nobody else.
+		key := p.Name
+		if key == "" {
+			key = p.PublicKey
+			if len(key) > 12 {
+				key = key[:12] + "\u2026"
+			}
 		}
 		rtt := "-"
 		if p.RTTMillis > 0 {
@@ -72,8 +78,8 @@ func printLive(st ControlStatus) error {
 		if p.Handshake > 0 {
 			hs = time.Since(time.Unix(p.Handshake, 0)).Round(time.Second).String() + " ago"
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%d\t%d\n",
-			key, p.State, orNone(p.Path, "-"), rtt, hs, p.RX, p.TX)
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%d\t%d\n",
+			key, orNone(p.Address, "-"), p.State, orNone(p.Path, "-"), rtt, hs, p.RX, p.TX)
 	}
 	return w.Flush()
 }

@@ -30,6 +30,7 @@ and writing a route do.
 |---|---|
 | `nfagent` | the client: one interface, one tunnel per peer |
 | `nfui` | a macOS menu bar item that reads the agent and changes nothing |
+| `desktop` | the window: the same, with room to show who the peers are |
 | `nfsignal` | where machines meet before there is a path between them |
 | `nfrelay` | carries the pairs that have no direct path |
 
@@ -89,3 +90,16 @@ through the tunnel — in userspace, over loopback.
 
 `nfui` is built on the machine it runs on. systray talks to the platform's own
 toolkit through cgo, and a cross build links happily and then shows no icon.
+
+The window is a separate Go module under `desktop`, built with
+[wails](https://wails.io): Go on one side, a web view on the other, and no
+browser shipped with it. `make -C desktop app` produces `netflow.app`, signed by
+nobody — macOS will run it once it is opened from the Finder and confirmed. The
+same source builds for Windows; Linux keeps the command line.
+
+The window talks to the agent over its control socket and holds no key and no
+credential. That socket is `0660` and owned by the group the machine's human
+accounts are in — `staff` on macOS, a `netflow` group the installer creates on
+Linux — so a window running as a person can read it and a service account
+cannot. Joining, leaving and choosing a mesh stay on the command line, where
+there is a credential behind them.
