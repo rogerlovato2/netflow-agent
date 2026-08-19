@@ -530,3 +530,49 @@ func TestOneRouteForTheWholeMesh(t *testing.T) {
 		}
 	}
 }
+
+// Two machines learn about each other at different moments, and must still meet
+// within seconds of the later one finding out.
+//
+// This is the failure it was written for. A policy change reaches the two ends
+// up to a map poll apart; whoever hears first offers into a peer that has no
+// session yet, and that message is dropped as coming from a stranger. Sending
+// the offer once meant the early side then waited out its whole negotiation
+// timeout for a reply to something the other end never saw — and with a backoff
+// growing between attempts, a pair that was allowed to talk again took minutes
+// to work it out.
+func TestAPeerThatLearnsLateIsStillMetQuickly(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	url := signalServer(t)
+	a := newMachine(t, ctx, url, "10.29.0.1")
+	b := newMachine(t, ctx, url, "10.29.0.2")
+	waitUntil(t, "both on the signal server", 20*time.Second, func() bool {
+		return a.eng.SignalConnected() && b.eng.SignalConnected()
+	})
+
+	// One side is told first, and offers into silence: the other has no peer
+	// list yet, so every message it sends is dropped as coming from a stranger.
+	a.eng.SetPeers(ctx, []Peer{{
+		PublicKey: b.pub, AllowedIPs: []netip.Prefix{netip.PrefixFrom(b.addr, 32)},
+	}})
+	time.Sleep(3 * time.Second)
+	if got := a.eng.PeerState(b.pub); got == p2p.StateConnected {
+		t.Fatal("connected to a machine that has not been told about it")
+	}
+
+	// The other side catches up, the way it would on its next map.
+	b.eng.SetPeers(ctx, []Peer{{
+		PublicKey: a.pub, AllowedIPs: []netip.Prefix{netip.PrefixFrom(a.addr, 32)},
+	}})
+
+	// Ten seconds is not a performance target, it is the line between the two
+	// behaviours: a repeated offer is answered within a couple of seconds of
+	// the late side waking up, and waiting out a negotiation timeout takes
+	// twenty-five before any backoff is added.
+	waitUntil(t, "the pair to meet", 10*time.Second, func() bool {
+		return a.eng.PeerState(b.pub) == p2p.StateConnected &&
+			b.eng.PeerState(a.pub) == p2p.StateConnected
+	})
+}

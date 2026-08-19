@@ -15,6 +15,13 @@ import (
 
 // Session is one peer, and the attempt to reach it.
 //
+// announceEvery is how often an attempt repeats its credentials while it waits.
+//
+// Two seconds: short enough that a machine which learns about its peer a poll
+// later still meets it within a poll, long enough that an attempt which is
+// simply going to fail sends a handful of messages rather than a stream.
+const announceEvery = 2 * time.Second
+
 // It owns exactly one ICE agent at a time. A failed negotiation does not reuse
 // the agent: ICE credentials identify an attempt, and a retry that kept them
 // would be answered with checks from the attempt that already failed. Restart
@@ -40,6 +47,11 @@ type Session struct {
 	remoteUfrag string
 	remotePwd   string
 	credsReady  chan struct{}
+	// settled is closed once there is a path. It is what stops the offer being
+	// repeated: receiving the peer's credentials is not the same as the peer
+	// having received ours, and stopping on the first would leave the other
+	// side waiting for something nobody is sending any more.
+	settled chan struct{}
 
 	// pending holds candidates that arrived before there was an agent to give
 	// them to. On the answering side this is the normal case, not an edge one:
@@ -60,6 +72,7 @@ func NewSession(local wgtypes.Key, remote wgtypes.Key, cfg Config, sig Signaller
 		log:         log.With("peer", shortKey(remote)),
 		state:       StateIdle,
 		credsReady:  make(chan struct{}),
+		settled:     make(chan struct{}),
 	}
 }
 
@@ -149,14 +162,24 @@ func (s *Session) Start(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("p2p: reading local credentials: %w", err)
 	}
-	if s.controlling {
-		err = s.sig.SendOffer(s.remote, ufrag, pwd)
-	} else {
-		err = s.sig.SendAnswer(s.remote, ufrag, pwd)
-	}
-	if err != nil {
+	if err := s.announce(ufrag, pwd); err != nil {
 		return fmt.Errorf("p2p: sending credentials: %w", err)
 	}
+	// And again, until the other side answers.
+	//
+	// Sending once assumes somebody was listening, and there is a common moment
+	// when nobody was: the two machines learn about each other from the
+	// management server at different times, up to a poll apart. Whoever hears
+	// first offers into a peer that has no session yet, the message is dropped
+	// as coming from a stranger, and that attempt then spends its whole
+	// timeout waiting for a reply to something the other end never saw. The
+	// pair only meets when two attempts happen to line up, which — with a
+	// backoff growing between them — is where minutes come from.
+	//
+	// Re-announcing costs one small message every couple of seconds for as long
+	// as an attempt is waiting, and it is idempotent: the same credentials
+	// arriving twice are a duplicate the far side already ignores.
+	go s.reannounce(ctx, ufrag, pwd)
 
 	if err := agent.GatherCandidates(); err != nil {
 		return fmt.Errorf("p2p: gathering candidates: %w", err)
@@ -188,6 +211,7 @@ func (s *Session) Start(ctx context.Context) error {
 	s.mu.Lock()
 	s.conn = conn
 	s.mu.Unlock()
+	close(s.settled)
 	s.setState(StateConnected)
 
 	if pair, err := agent.GetSelectedCandidatePair(); err == nil && pair != nil {
@@ -353,4 +377,34 @@ func shortKey(k wgtypes.Key) string {
 		return s
 	}
 	return s[:8]
+}
+
+// announce sends this attempt's credentials to the peer.
+func (s *Session) announce(ufrag, pwd string) error {
+	if s.controlling {
+		return s.sig.SendOffer(s.remote, ufrag, pwd)
+	}
+	return s.sig.SendAnswer(s.remote, ufrag, pwd)
+}
+
+// reannounce repeats them until the peer answers or the attempt ends.
+func (s *Session) reannounce(ctx context.Context, ufrag, pwd string) {
+	t := time.NewTicker(announceEvery)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-s.settled:
+			// There is a path, so both ends have everything they need.
+			// Stopping at the peer's answer instead would be the same bug seen
+			// from the other side: our credentials might still be the thing
+			// they are waiting for.
+			return
+		case <-t.C:
+			if err := s.announce(ufrag, pwd); err != nil {
+				s.log.Debug("p2p: could not repeat the offer", "err", err)
+			}
+		}
+	}
 }
