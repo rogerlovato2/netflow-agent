@@ -6,9 +6,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/rogerlovato2/netflow-agent/internal/filter"
 	"io"
 	"log/slog"
 	"net/http"
+	"net/netip"
 	"os"
 	"strings"
 	"sync"
@@ -118,7 +120,8 @@ func machineFacts() map[string]string {
 		"hostname": host,
 		// Empty when the last attempt was fine, which is also what a machine
 		// that has never tried reports.
-		"updateError": updateError(),
+		"updateError":   updateError(),
+		"firewallError": firewallError(),
 	}
 }
 
@@ -396,6 +399,11 @@ func followTheMap(ctx context.Context, eng *engine.Engine, cfg *Config, path str
 				// Compared before applying, so an unchanged map is not reported
 				// as an event every twenty seconds. SetPeers is a reconcile and
 				// would do no harm; the log would.
+				// The access rules go in with the peer list and from the same
+				// map, so that what a machine allows and who it talks to can
+				// never be two different versions of the truth.
+				applyAccessRules(eng, m.Peers, log)
+
 				if fingerprint := mapFingerprint(m.Peers); fingerprint != last {
 					log.Info("network map updated", "peers", len(peers))
 					last = fingerprint
@@ -487,4 +495,62 @@ func restart(eng *engine.Engine) {
 	fmt.Fprintln(os.Stderr,
 		"restarting to apply a change from the server; the service manager will start it again")
 	os.Exit(1)
+}
+
+// lastFirewallError is what this machine says about applying its rules.
+//
+// Reported rather than only logged: a machine that cannot apply a rule is a
+// machine where a one-way policy is two-way, and the panel is where somebody
+// would look to find out which machine that is.
+var lastFirewallError struct {
+	sync.Mutex
+	text string
+}
+
+func setFirewallError(err error) {
+	lastFirewallError.Lock()
+	defer lastFirewallError.Unlock()
+	if err == nil {
+		lastFirewallError.text = ""
+		return
+	}
+	lastFirewallError.text = err.Error()
+}
+
+func firewallError() string {
+	lastFirewallError.Lock()
+	defer lastFirewallError.Unlock()
+	return lastFirewallError.text
+}
+
+// applyAccessRules hands the engine what each peer may start.
+func applyAccessRules(eng *engine.Engine, peers []PeerConfig, log *slog.Logger) {
+	rules := make(map[netip.Addr][]filter.Rule, len(peers))
+	for _, p := range peers {
+		addr := p.Address
+		if addr == "" && len(p.AllowedIPs) > 0 {
+			// An older server sends only the allowed IPs, whose first entry is
+			// the peer's own address.
+			addr, _, _ = strings.Cut(p.AllowedIPs[0], "/")
+		}
+		a, err := netip.ParseAddr(addr)
+		if err != nil {
+			continue
+		}
+		// Nil and empty mean different things here: a peer with no rules may
+		// start nothing, and it has to be in the map for the filter to know
+		// that rather than fall through to "not mentioned".
+		if p.Inbound == nil {
+			rules[a] = []filter.Rule{}
+			continue
+		}
+		rules[a] = p.Inbound
+	}
+
+	if err := eng.SetAccessRules(rules); err != nil {
+		setFirewallError(err)
+		log.Warn("could not apply the access rules", "err", err)
+		return
+	}
+	setFirewallError(nil)
 }

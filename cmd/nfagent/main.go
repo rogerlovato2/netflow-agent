@@ -14,6 +14,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"github.com/rogerlovato2/netflow-agent/internal/filter"
 	"log/slog"
 	"net/netip"
 	"os"
@@ -154,6 +155,16 @@ type RelayConfig struct {
 type PeerConfig struct {
 	PublicKey  string   `json:"publicKey"`
 	AllowedIPs []string `json:"allowedIPs"`
+	// Address is the peer's own address in the mesh, which is what an access
+	// rule is written against. It is the first of the allowed IPs today, and
+	// carried separately so that stays an implementation detail rather than an
+	// assumption spread through the code.
+	Address string `json:"address,omitempty"`
+	// Inbound is what this peer may start against this machine. Empty means
+	// nothing may be started: the peer is here because this machine may start
+	// something against it, and the replies get back because the filter that
+	// enforces this has state.
+	Inbound []filter.Rule `json:"inbound,omitempty"`
 }
 
 func up(args []string) error {

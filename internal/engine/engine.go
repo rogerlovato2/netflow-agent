@@ -11,6 +11,7 @@ package engine
 import (
 	"context"
 	"fmt"
+	"github.com/rogerlovato2/netflow-agent/internal/filter"
 	"log/slog"
 	"math/rand/v2"
 	"net/netip"
@@ -433,6 +434,19 @@ func (e *Engine) Goodbye() {
 		}
 	}
 }
+
+// SetAccessRules says what each peer may start against this machine.
+//
+// The engine only passes it along: what a rule means is the same everywhere,
+// and where it is applied is the device's business — in this process on the
+// platforms whose WireGuard runs here, and in the kernel's firewall where the
+// kernel holds the interface.
+func (e *Engine) SetAccessRules(rules map[netip.Addr][]filter.Rule) error {
+	return e.dev.SetAccessRules(rules)
+}
+
+// EnforcesAccessRules reports whether this machine can apply them at all.
+func (e *Engine) EnforcesAccessRules() bool { return e.dev.EnforcesAccessRules() }
 
 // PeerState reports where a peer's negotiation stands.
 func (e *Engine) PeerState(pub wgtypes.Key) p2p.State {

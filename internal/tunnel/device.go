@@ -2,7 +2,9 @@ package tunnel
 
 import (
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"github.com/rogerlovato2/netflow-agent/internal/filter"
 	"log/slog"
 	"net/netip"
 	"strings"
@@ -55,6 +57,12 @@ type Device struct {
 	// what opening did. On macOS that includes an alias on lo0, which outlives
 	// the interface if nobody takes it away.
 	addrs []netip.Addr
+
+	// filter decides which packets arriving from the mesh are delivered, on the
+	// devices where this process owns the data path. It is nil for a kernel
+	// interface, where the packet is delivered before we could look at it and
+	// the rules are applied by the kernel's own firewall instead.
+	filter *filter.Filter
 
 	log *slog.Logger
 
@@ -332,4 +340,36 @@ func (d *Device) Status() (map[string]PeerStatus, error) {
 	}
 	flush()
 	return out, nil
+}
+
+// SetAccessRules says what each peer is allowed to start against this machine.
+//
+// Two places, one meaning. Where this process owns the data path — macOS,
+// Windows, and Linux in userspace — the rules are applied in Go, on the packet
+// itself. Where the kernel holds the interface, the packet is delivered before
+// this code could look at it, so the same rules are written into the kernel's
+// own firewall. What a rule means does not change; only who enforces it does.
+func (d *Device) SetAccessRules(rules map[netip.Addr][]filter.Rule) error {
+	if d.filter != nil {
+		d.filter.SetRules(rules)
+		return nil
+	}
+	if !filter.NFTablesAvailable() {
+		// Said rather than silently ignored: a machine that cannot enforce a
+		// rule is a machine where a one-way policy is two-way, and somebody
+		// should know which machine that is.
+		return errNoFirewall
+	}
+	return filter.ApplyNFTables(d.name, rules)
+}
+
+// errNoFirewall is what a machine says when it cannot apply the rules it was
+// given.
+var errNoFirewall = errors.New(
+	"this machine has no way to apply access rules: nftables is not installed, " +
+		"so every policy behaves as two-way here")
+
+// EnforcesAccessRules reports whether this machine can apply them at all.
+func (d *Device) EnforcesAccessRules() bool {
+	return d.filter != nil || filter.NFTablesAvailable()
 }
