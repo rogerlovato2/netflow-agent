@@ -76,10 +76,10 @@ func (t *tray) build() {
 	t.connect = systray.AddMenuItem("Disconnect", "")
 
 	systray.AddSeparator()
-	// The panel and the log live here rather than in the window: they are the
-	// two things somebody wants when they are not going to read anything else,
-	// and reaching them should not cost a window.
-	panel := systray.AddMenuItem("Open the panel", "")
+	// The log lives here rather than in the window: it is what somebody wants
+	// when they are not going to read anything else, and reaching it should not
+	// cost a window. The panel is not here at all — it is a web page about the
+	// whole mesh, and this menu is about this machine.
 	logs := systray.AddMenuItem("Open the log", "")
 
 	systray.AddSeparator()
@@ -95,8 +95,6 @@ func (t *tray) build() {
 			case <-t.connect.ClickedCh:
 				// Whatever it is now, ask for the other one.
 				t.app.SetConnected(t.app.Status().Paused)
-			case <-panel.ClickedCh:
-				t.app.OpenPanel()
 			case <-logs.ClickedCh:
 				t.app.OpenLog()
 			case <-quit.ClickedCh:

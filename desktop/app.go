@@ -108,19 +108,6 @@ func (a *App) SetConnected(on bool) Status {
 	return st
 }
 
-// OpenPanel opens the management server in a browser.
-//
-// The address comes from the agent rather than from anything typed here: this
-// machine already knows which panel admitted it, and asking somebody to
-// remember a URL they have already proved they know is busywork.
-func (a *App) OpenPanel() {
-	st := a.Status()
-	if st.Server == "" {
-		return
-	}
-	wruntime.BrowserOpenURL(a.ctx, st.Server)
-}
-
 // Fit makes the window as tall as what is in it.
 //
 // A status window with two peers in a frame built for ten looks broken, and one
