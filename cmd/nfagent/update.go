@@ -55,6 +55,13 @@ func considerUpdate(ctx context.Context, eng *engine.Engine, cfg *Config, policy
 	if cfg.NoRemoteUpdate || policy == nil || !policy.Enabled {
 		return
 	}
+	// The map is polled every twenty seconds and a request stays alive for half
+	// an hour, so "may update" arrives many times for one press of one button.
+	// Without this, that is a download every twenty seconds.
+	if !attempts.begin() {
+		return
+	}
+	defer attempts.done()
 	if !selfupdate.Enabled() {
 		// Said once per attempt rather than never: a panel with the switch on
 		// and a build with no key will otherwise sit there looking like it is
@@ -98,4 +105,42 @@ func watchForUpdates(ctx context.Context, eng *engine.Engine, cfg *Config, polic
 			considerUpdate(ctx, eng, cfg, policy(), log)
 		}
 	}
+}
+
+// attemptGap is the least time between two tries.
+//
+// Five minutes: a machine that failed for a reason that will pass — the release
+// page unreachable, a disk that was full — gets several more chances inside the
+// window a request stays open, without turning a standing permission into a
+// download loop.
+const attemptGap = 5 * time.Minute
+
+// attemptGate keeps one update running at a time, and no more often than
+// attemptGap.
+type attemptGate struct {
+	mu      sync.Mutex
+	running bool
+	last    time.Time
+}
+
+var attempts attemptGate
+
+// begin reports whether this attempt may go ahead, and claims the slot if so.
+func (g *attemptGate) begin() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.running || time.Since(g.last) < attemptGap {
+		return false
+	}
+	g.running = true
+	return true
+}
+
+func (g *attemptGate) done() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.running = false
+	// Counted from the end, not the start: a download that took four minutes
+	// should not be followed by another one a minute later.
+	g.last = time.Now()
 }

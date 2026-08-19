@@ -329,6 +329,10 @@ func followTheMap(ctx context.Context, eng *engine.Engine, cfg *Config, path str
 			}
 
 			setPolicy(m.Update)
+			// Acted on as it arrives, not only on the six-hourly tick: a
+			// request made in the panel is somebody watching the row and
+			// waiting for it to change.
+			go considerUpdate(ctx, eng, cfg, m.Update, log)
 
 			// Two things the server can change about this machine that it
 			// cannot adopt in place.
