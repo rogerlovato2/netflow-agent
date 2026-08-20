@@ -275,6 +275,7 @@ func (e *Engine) Run(ctx context.Context) error {
 	e.sig.OnMessage(e.dispatch)
 	go e.sig.Run(ctx)
 	go e.watchdog(ctx)
+	go e.escapeRelay(ctx)
 
 	<-ctx.Done()
 	e.closeAllPeers()
@@ -643,6 +644,176 @@ func (e *Engine) wakeStuck() {
 		}
 		select {
 		case l.wake <- struct{}{}:
+		default:
+		}
+	}
+}
+
+// How a pair that has settled on the relay is given another chance at a direct
+// path.
+//
+// ICE selects the first pair that works and never revisits the choice: pion
+// nominates once, and a direct path that becomes available afterwards is not
+// adopted, ever. So a pair that fell back to the relay during a busy moment
+// stays there for the life of the process, paying a round trip through somebody
+// else's machine for every packet it sends, while a perfectly good direct path
+// sits unused beside it. It was measured: the pairs still on the relay were,
+// without exception, the oldest sessions in the mesh, and every pair negotiated
+// after the fix to the starting race went direct.
+const (
+	// relayCheckEvery is how often the question is asked. Cheap: it reads state
+	// that is already in memory.
+	relayCheckEvery = 2 * time.Minute
+
+	// relaySettledFor is how long a relayed path must have stood before it is
+	// disturbed. A pair that has just connected is still finding its feet, and
+	// tearing it down to look for something better would be churn rather than
+	// repair.
+	relaySettledFor = 10 * time.Minute
+
+	// relayRetryMin and relayRetryMax bound the wait between attempts on one
+	// pair. A pair that genuinely has no direct path — a shop behind carrier
+	// NAT — must not spend the rest of its life renegotiating to discover that
+	// again every quarter of an hour.
+	relayRetryMin = 15 * time.Minute
+	relayRetryMax = 4 * time.Hour
+)
+
+// relayWatch is what is remembered about one pair sitting on the relay.
+type relayWatch struct {
+	// since is when it was first seen relayed, and it is what decides who goes
+	// first: the pair that has been paying longest.
+	since time.Time
+	// next is when it is worth disturbing again, and wait is how long is added
+	// after each attempt that did not get it off the relay.
+	next time.Time
+	wait time.Duration
+}
+
+// pickRelayToRetry decides which pair, if any, is worth renegotiating now, and
+// updates the bookkeeping for the one it chooses.
+//
+// paths is every peer against the kind of path it is on: "relay", "direct", or
+// "" for a pair that is not connected at this instant.
+//
+// The empty case is the one worth being careful about, and it is why this is a
+// function of its own. A pair being renegotiated is not connected while it is
+// being renegotiated, so treating "no path" as success would clear the record
+// of every attempt at the exact moment it was made — and a pair with no direct
+// path to find would try again fifteen minutes later, forever, having reset its
+// own backoff each time. Only an actual direct path counts as having worked.
+func pickRelayToRetry(paths map[string]string, seen map[string]*relayWatch, now time.Time) string {
+	var pick string
+	var picked *relayWatch
+
+	for key, kind := range paths {
+		switch kind {
+		case "direct":
+			// It worked, whether this loop had anything to do with it.
+			delete(seen, key)
+			continue
+		case "relay":
+		default:
+			// Mid-negotiation, or down. Leave the record alone.
+			continue
+		}
+		st, ok := seen[key]
+		if !ok {
+			// Newly noticed. Nothing is disturbed until it has stood a while.
+			seen[key] = &relayWatch{since: now, next: now.Add(relaySettledFor), wait: relayRetryMin}
+			continue
+		}
+		if now.Before(st.next) {
+			continue
+		}
+		// One at a time. A machine with a dozen relayed peers that renegotiated
+		// all of them at once would take its whole mesh down to improve it.
+		if picked == nil || st.since.Before(picked.since) {
+			pick, picked = key, st
+		}
+	}
+
+	// Peers that are gone stop being watched.
+	for key := range seen {
+		if _, ok := paths[key]; !ok {
+			delete(seen, key)
+		}
+	}
+
+	if picked == nil {
+		return ""
+	}
+	picked.next = now.Add(picked.wait)
+	picked.wait = min(picked.wait*2, relayRetryMax)
+	return pick
+}
+
+// escapeRelay renegotiates, slowly and one at a time, the pairs that have
+// settled on the relay.
+//
+// Nothing here finds a better path. It ends the current attempt, and the peer's
+// own retry loop starts a fresh negotiation — which is where a direct path gets
+// its fair race, because relay candidates are held back for eight seconds
+// there. The whole of this function is deciding when that is worth the few
+// seconds of downtime it costs the pair.
+func (e *Engine) escapeRelay(ctx context.Context) {
+	// With no relay configured there is nothing to escape from: every pair is
+	// already direct or already failing, and neither is helped by a restart.
+	if len(e.p2pConfig().TURN) == 0 {
+		return
+	}
+
+	t := time.NewTicker(relayCheckEvery)
+	defer t.Stop()
+
+	seen := map[string]*relayWatch{}
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+
+		e.mu.Lock()
+		links := make(map[string]*peerLink, len(e.peers))
+		for key, l := range e.peers {
+			links[key] = l
+		}
+		e.mu.Unlock()
+
+		paths := make(map[string]string, len(links))
+		for key, l := range links {
+			l.mu.Lock()
+			sess := l.session
+			l.mu.Unlock()
+			if sess == nil {
+				paths[key] = ""
+				continue
+			}
+			paths[key] = sess.Path().Kind
+		}
+
+		now := time.Now()
+		key := pickRelayToRetry(paths, seen, now)
+		if key == "" {
+			continue
+		}
+		link := links[key]
+		e.log.Info("engine: peer has settled on the relay; renegotiating to look for a direct path",
+			"peer", short(mustKey(key)),
+			"on_relay_for", now.Sub(seen[key].since).Round(time.Second))
+
+		link.mu.Lock()
+		abandon := link.attemptCancel
+		link.abandonWhy = "renegotiating to look for a direct path instead of the relay"
+		link.mu.Unlock()
+		if abandon != nil {
+			abandon()
+		}
+		// And try now rather than after a backoff: this engine chose the moment,
+		// so there is nothing to wait for.
+		select {
+		case link.wake <- struct{}{}:
 		default:
 		}
 	}
