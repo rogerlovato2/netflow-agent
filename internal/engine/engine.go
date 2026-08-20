@@ -154,6 +154,9 @@ type Engine struct {
 
 	mu    sync.Mutex
 	peers map[string]*peerLink
+	// saidOffline is when each peer was last reported missing from the signal
+	// server, so the notice is one a minute and not one every retry.
+	saidOffline map[string]time.Time
 }
 
 // peerLink is everything the engine holds for one peer.
@@ -1015,11 +1018,44 @@ func (e *Engine) dispatch(m signal.Message) {
 			leaving()
 		}
 	case signal.KindOffline:
-		// Nothing to do beyond noting it. The negotiation will time out on its
+		// Nothing to do beyond saying so. The negotiation will time out on its
 		// own and the retry loop is already the right response; tearing down
 		// here would only race with it.
-		e.log.Debug("engine: peer is not on the signal server", "peer", short(m.From))
+		//
+		// But saying so matters, and this was at debug level for months, which
+		// is the same as not saying it. "The signal server does not think that
+		// peer is connected" and "the two of you cannot traverse each other's
+		// NAT" produce the identical symptom — a pair that never comes up —
+		// and they have nothing in common. One is a stale registration on a
+		// server; the other is physics. Hours went into the second while it
+		// was the first.
+		//
+		// Rate-limited per peer, because a retry loop can produce one of these
+		// every couple of seconds and a log nobody can read is also a log
+		// nobody reads.
+		if e.shouldSayOffline(m.From) {
+			e.log.Warn("engine: the signal server says this peer is not connected",
+				"peer", short(m.From))
+		}
 	}
+}
+
+// offlineEvery is how often one peer being reported offline is worth a line.
+const offlineEvery = time.Minute
+
+// shouldSayOffline rate-limits the notice to one a minute per peer.
+func (e *Engine) shouldSayOffline(peer wgtypes.Key) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.saidOffline == nil {
+		e.saidOffline = map[string]time.Time{}
+	}
+	key := peer.String()
+	if last, ok := e.saidOffline[key]; ok && time.Since(last) < offlineEvery {
+		return false
+	}
+	e.saidOffline[key] = time.Now()
+	return true
 }
 
 // feed hands one signalling message to a session.
