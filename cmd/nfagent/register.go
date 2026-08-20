@@ -48,6 +48,11 @@ type peerReport struct {
 	RX        uint64 `json:"rx"`
 	TX        uint64 `json:"tx"`
 	Handshake int64  `json:"handshake"`
+	// Trouble is why the last attempt at this peer ended. It travels to the
+	// panel so a stuck pair explains itself there, instead of somebody having
+	// to log into the machine and turn on debug logging — which is what it
+	// took the first three times.
+	Trouble string `json:"trouble,omitempty"`
 }
 
 // reportToServer tells the server what this machine sees, for as long as it runs.
@@ -102,6 +107,7 @@ func collectReport(eng *engine.Engine) ([]peerReport, error) {
 			RX:        st.RXBytes,
 			TX:        st.TXBytes,
 			Handshake: st.LastHandshake,
+			Trouble:   clipTrouble(eng, key),
 		})
 	}
 	return out, nil
@@ -634,6 +640,15 @@ func firewallError() string {
 // The whole list every time, including an empty one. A machine that was a
 // router and is not any more has to stop being one, and the only way to know
 // that from a list of what it should carry is to act on the whole list.
+// clipTrouble is the reason bounded to something a table can hold.
+func clipTrouble(eng *engine.Engine, key wgtypes.Key) string {
+	why, _ := eng.PeerTrouble(key)
+	if len(why) > 200 {
+		return why[:200]
+	}
+	return why
+}
+
 func applyAdvertised(rt router.Router, eng *engine.Engine, cfg *Config,
 	advertised []advertisedRoute, log *slog.Logger) {
 	routes := make([]router.Route, 0, len(advertised))

@@ -112,6 +112,10 @@ type ControlPeer struct {
 	State     string `json:"state"`
 	Path      string `json:"path"`
 	RTTMillis int    `json:"rttMs"`
+	// Trouble is why the last attempt at this peer ended: "no path to the
+	// peer" is a NAT problem, a timeout waiting for credentials is a
+	// signalling one, and from a status line they look identical.
+	Trouble   string `json:"trouble,omitempty"`
 	RX        uint64 `json:"rx"`
 	TX        uint64 `json:"tx"`
 	Handshake int64  `json:"handshake"`
@@ -223,8 +227,10 @@ func collectControlStatus(eng *engine.Engine, cfg *Config) ControlStatus {
 		// What the server last said about this peer, so the list can be read
 		// by somebody who has never seen a public key.
 		known := peerFromMap(id)
+		trouble, _ := eng.PeerTrouble(key)
 		st.Peers = append(st.Peers, ControlPeer{
 			PublicKey: id,
+			Trouble:   trouble,
 			Name:      known.Name,
 			Address:   known.Address,
 			State:     string(eng.PeerState(key)),

@@ -178,6 +178,15 @@ type peerLink struct {
 	session *p2p.Session
 	proxy   *tunnel.Proxy
 	state   p2p.State
+	// why the last attempt ended, and when.
+	//
+	// This existed only as a debug line, which is the same as not existing: a
+	// pair that will not connect has exactly one interesting question — was
+	// there no path, or did the negotiation never get an answer — and the
+	// difference between those is the difference between a NAT problem and a
+	// signalling problem. Nine hours went into the wrong one of those.
+	lastErr   string
+	lastErrAt time.Time
 	// early holds signalling that arrived before there was a session to give it
 	// to, replayed in order the moment one exists.
 	early []signal.Message
@@ -689,6 +698,23 @@ func (e *Engine) RelayConfigured() bool {
 	return len(e.cfg.P2P.TURN) > 0
 }
 
+// PeerTrouble is why the last attempt at a peer ended, and how long ago.
+//
+// Empty when the peer is connected or has never failed. It is the answer to the
+// only question a stuck pair raises — no path, or no answer — and it belongs
+// somewhere a person can read rather than in a log level nobody turns on.
+func (e *Engine) PeerTrouble(pub wgtypes.Key) (string, time.Time) {
+	e.mu.Lock()
+	link, ok := e.peers[pub.String()]
+	e.mu.Unlock()
+	if !ok {
+		return "", time.Time{}
+	}
+	link.mu.Lock()
+	defer link.mu.Unlock()
+	return link.lastErr, link.lastErrAt
+}
+
 // PeerKeys is every peer this engine is currently working on.
 //
 // It is the authority on that question, and the configuration file is not: the
@@ -740,6 +766,14 @@ func (e *Engine) keepPeerConnected(ctx context.Context, link *peerLink) {
 			e.log.Debug("engine: peer connection ended",
 				"peer", short(link.spec.PublicKey), "err", err, "retry_in", delay)
 		}
+		link.mu.Lock()
+		if err != nil {
+			link.lastErr, link.lastErrAt = err.Error(), time.Now()
+		} else {
+			// A connection that lasted answers the question by existing.
+			link.lastErr, link.lastErrAt = "", time.Time{}
+		}
+		link.mu.Unlock()
 
 		select {
 		case <-ctx.Done():
