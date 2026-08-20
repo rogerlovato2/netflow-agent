@@ -321,6 +321,19 @@ func up(args []string) error {
 		log.Info("following the network map", "server", cfg.Server, "cached_peers", len(peers))
 		go followTheMap(ctx, eng, cfg, rt, *path, log)
 		go watchRelay(ctx, eng, log)
+
+		// The last thing the engine tries when a peer has been unreachable for
+		// twenty minutes and reconnecting the signalling did not help. A fresh
+		// process has fixed this every time it has happened, instantly, which
+		// is evidence of something wrong in a way nothing inside the process
+		// can find. Until that is understood, starting over beats being right
+		// about how hard it tried.
+		eng.OnGiveUp(func() {
+			eng.Goodbye()
+			fmt.Fprintln(os.Stderr,
+				"restarting: a peer has been unreachable for too long and reconnecting did not help")
+			os.Exit(1)
+		})
 		go reportToServer(ctx, eng, cfg, log)
 	}
 

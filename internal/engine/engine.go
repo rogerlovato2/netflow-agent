@@ -157,6 +157,11 @@ type Engine struct {
 	// saidOffline is when each peer was last reported missing from the signal
 	// server, so the notice is one a minute and not one every retry.
 	saidOffline map[string]time.Time
+
+	// giveUp asks whoever owns this process to replace it. Nil means nobody
+	// will, which is the right answer for a test and for an engine somebody
+	// embedded: exiting is a decision for the program, not for a library.
+	giveUp func()
 }
 
 // peerLink is everything the engine holds for one peer.
@@ -498,6 +503,24 @@ const (
 	// can no longer reach, and this must not turn into a reconnect every three
 	// minutes on behalf of a machine nobody has turned on.
 	resetEvery = 15 * time.Minute
+
+	// giveUpAfter is how long a peer stays unreachable before this process
+	// stops trying to fix itself and asks to be replaced.
+	//
+	// Twenty minutes, and only when reconnecting the signalling has already
+	// been tried and did not help. Restarting the agent is the one thing that
+	// worked every single time this went wrong, and it worked instantly — which
+	// is evidence that something in the process is wrong in a way nothing in
+	// the process can find. Until that is understood, a machine that cannot
+	// reach a peer for twenty minutes is better off starting over than being
+	// right about how hard it tried.
+	giveUpAfter = 20 * time.Minute
+
+	// restartEvery is the floor between self-restarts. A restart costs every
+	// working tunnel a few seconds, so a machine whose peer is simply switched
+	// off must not spend its life bouncing: at worst it restarts once an hour,
+	// and only while something is actually broken.
+	restartEvery = time.Hour
 )
 
 // watchdog reconnects the signalling when a peer has been unreachable too long.
@@ -532,7 +555,7 @@ func (e *Engine) watchdog(ctx context.Context) {
 	// counts from the moment it was first noticed, not from zero: a machine
 	// that just started has not failed at anything yet.
 	lastGood := map[string]time.Time{}
-	var lastReset time.Time
+	var lastReset, lastRestart time.Time
 
 	for {
 		select {
@@ -573,6 +596,22 @@ func (e *Engine) watchdog(ctx context.Context) {
 		if !lastReset.IsZero() && now.Sub(lastReset) < resetEvery {
 			continue
 		}
+		// Reconnecting has already been tried and the peer is still gone. Ask
+		// to be replaced: the service manager starts a fresh process, and a
+		// fresh process has fixed this every time it has happened.
+		e.mu.Lock()
+		giveUp := e.giveUp
+		e.mu.Unlock()
+		if worst > giveUpAfter && giveUp != nil {
+			if lastRestart.IsZero() || now.Sub(lastRestart) > restartEvery {
+				e.log.Warn("engine: a peer has been unreachable for far too long; restarting",
+					"peer", short(mustKey(worstPeer)), "for", worst.Round(time.Second))
+				lastRestart = now
+				giveUp()
+				return
+			}
+		}
+
 		e.log.Warn("engine: a peer has been unreachable for a while; reconnecting the signalling",
 			"peer", short(mustKey(worstPeer)), "for", worst.Round(time.Second))
 		e.sig.Reset()
@@ -721,6 +760,18 @@ func (e *Engine) ProbeRelay(ctx context.Context) error {
 		}
 	}
 	return last
+}
+
+// OnGiveUp sets what to do when this engine decides a fresh process would do
+// better than it can.
+//
+// Left unset, nothing happens and the engine keeps trying, which is what a test
+// and an embedded engine want. Ending the process is a decision for the program
+// that owns it.
+func (e *Engine) OnGiveUp(f func()) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.giveUp = f
 }
 
 // RelayConfigured reports whether a pair with no direct path has somewhere to
