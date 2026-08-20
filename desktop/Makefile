@@ -62,9 +62,16 @@ install: app
 # So build/bin is a link to somewhere outside. Nothing is lost — it is output,
 # ignored by git, and rebuilt from nothing every time.
 .PHONY: _outside
+# An absolute path, and not $(TMPDIR): that is empty on a build runner, which
+# turned the link into a relative path pointing at nothing and failed the
+# release with an error about a directory that does not exist.
+OUTDIR ?= /tmp/netflow-build-$(shell id -u)
+
 _outside:
-	@mkdir -p "$(TMPDIR)netflow-bin"
-	@if [ ! -L build/bin ]; then rm -rf build/bin; ln -s "$(TMPDIR)netflow-bin" build/bin; fi
+	@mkdir -p "$(OUTDIR)"
+	@if [ ! -L build/bin ] || [ "$$(readlink build/bin)" != "$(OUTDIR)" ]; then \
+		rm -rf build/bin; ln -s "$(OUTDIR)" build/bin; \
+	fi
 
 # dmg packages the bundle for another Mac.
 #
