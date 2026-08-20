@@ -320,6 +320,7 @@ func up(args []string) error {
 	if cfg.Server != "" && cfg.Token != "" {
 		log.Info("following the network map", "server", cfg.Server, "cached_peers", len(peers))
 		go followTheMap(ctx, eng, cfg, rt, *path, log)
+		go watchRelay(ctx, eng, log)
 		go reportToServer(ctx, eng, cfg, log)
 	}
 

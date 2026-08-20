@@ -134,6 +134,10 @@ func machineFacts() map[string]string {
 		// own words. A router that silently fails to forward is one somebody
 		// debugs from the far end, wondering why a printer stopped answering.
 		"routingError": RoutingError(),
+		// Whether this machine can actually use the relay, which is a
+		// different question from whether one is configured — and the one that
+		// decides whether a pair with no direct path has anywhere to go.
+		"relayError": RelayError(),
 	}
 }
 
@@ -690,6 +694,77 @@ func applyAdvertised(rt router.Router, eng *engine.Engine, cfg *Config,
 	} else {
 		log.Info("no longer carrying any network for the mesh")
 	}
+}
+
+// watchRelay asks, now and then, whether this machine can actually use the
+// relay.
+//
+// Every ten minutes and once at the start. It is one allocation and its
+// release — a handful of packets — and it answers the question that took a day
+// to ask out loud: not "is a relay configured" but "can this machine, on this
+// network, behind this firewall, allocate on it".
+//
+// The answer goes to the panel with everything else the machine says about
+// itself. A machine that cannot reach the relay fails against every peer it
+// cannot reach directly, and from the far end that is indistinguishable from
+// the peer being the problem.
+func watchRelay(ctx context.Context, eng *engine.Engine, log *slog.Logger) {
+	check := func() {
+		if !eng.RelayConfigured() {
+			setRelayError(nil)
+			return
+		}
+		probeCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+		defer cancel()
+		err := eng.ProbeRelay(probeCtx)
+		setRelayError(err)
+		if err != nil {
+			log.Warn("this machine cannot use the relay", "err", err)
+		}
+	}
+
+	// Not immediately: the first map has to arrive before there is a relay to
+	// probe, and probing before that would report "no relay" as a fault.
+	select {
+	case <-ctx.Done():
+		return
+	case <-time.After(30 * time.Second):
+	}
+	check()
+
+	t := time.NewTicker(10 * time.Minute)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			check()
+		}
+	}
+}
+
+// lastRelayError is why this machine could not use the relay, for the panel.
+var lastRelayError struct {
+	sync.Mutex
+	value string
+}
+
+func setRelayError(err error) {
+	lastRelayError.Lock()
+	defer lastRelayError.Unlock()
+	if err == nil {
+		lastRelayError.value = ""
+		return
+	}
+	lastRelayError.value = err.Error()
+}
+
+// RelayError is the last reason this machine could not use the relay.
+func RelayError() string {
+	lastRelayError.Lock()
+	defer lastRelayError.Unlock()
+	return lastRelayError.value
 }
 
 // routing is whether this machine currently forwards for anything, so that

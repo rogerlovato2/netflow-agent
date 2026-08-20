@@ -697,6 +697,32 @@ func (e *Engine) p2pConfig() p2p.Config {
 	return c
 }
 
+// ProbeRelay finds out whether this machine can actually use the relay.
+//
+// Configured and usable are different questions, and only the first was ever
+// asked. A machine whose outbound UDP to the relay is blocked, or whose
+// credentials it rejects, gathers no relay candidate and then fails against
+// every peer it cannot reach directly — while its status says the relay is
+// configured, which is true and beside the point.
+func (e *Engine) ProbeRelay(ctx context.Context) error {
+	e.mu.Lock()
+	servers := append([]p2p.TURNServer(nil), e.cfg.P2P.TURN...)
+	e.mu.Unlock()
+	if len(servers) == 0 {
+		return nil
+	}
+	// Any one of them working is enough: they are alternatives, not a set.
+	var last error
+	for _, s := range servers {
+		if err := p2p.ProbeRelay(ctx, s); err == nil {
+			return nil
+		} else {
+			last = err
+		}
+	}
+	return last
+}
+
 // RelayConfigured reports whether a pair with no direct path has somewhere to
 // fall back to. Asked of the engine and not of a file, because the relay
 // arrives with the network map and the file only knows what it was last told.
