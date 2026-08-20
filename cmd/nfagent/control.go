@@ -107,8 +107,8 @@ type ControlPeer struct {
 	// Name and Address come from the map rather than from the tunnel: the
 	// device knows keys and prefixes, and a person reading a window knows
 	// neither.
-	Name    string `json:"name,omitempty"`
-	Address string `json:"address,omitempty"`
+	Name      string `json:"name,omitempty"`
+	Address   string `json:"address,omitempty"`
 	State     string `json:"state"`
 	Path      string `json:"path"`
 	RTTMillis int    `json:"rttMs"`
