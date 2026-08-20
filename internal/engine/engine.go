@@ -468,42 +468,50 @@ const (
 	// the engine already keeps.
 	watchdogEvery = 30 * time.Second
 
-	// stuckAfter is how long every peer must have been unreachable before the
+	// stuckAfter is how long a peer must have been unreachable before the
 	// signalling is suspected. Long enough that an ordinary renegotiation, a
 	// reboot at the other end, or a minute of bad network is not it.
 	stuckAfter = 3 * time.Minute
 
-	// resetEvery bounds how often the signalling may be reconnected. A mesh
-	// where nobody is switched on is indistinguishable from one where the
-	// signalling is broken, and it must not turn into a reconnect every three
-	// minutes forever.
+	// resetEvery bounds how often the signalling may be reconnected. A peer
+	// that is simply switched off is indistinguishable from one the signalling
+	// can no longer reach, and this must not turn into a reconnect every three
+	// minutes on behalf of a machine nobody has turned on.
 	resetEvery = 15 * time.Minute
 )
 
-// watchdog reconnects the signalling when nothing has connected for a while.
+// watchdog reconnects the signalling when a peer has been unreachable too long.
 //
-// The failure it exists for is the one nothing else can see: a socket that is
-// open, answers every ping, and delivers nothing — a signal server that was
-// restarted or upgraded underneath a running agent. Every negotiation then
-// fails the way a NAT problem fails, no timeout fires because nothing has timed
-// out, and the retry loop tries forever against a server that will never
-// answer. That is a whole afternoon of a mesh being down with every log saying
-// it is fine, and the only thing that fixed it was somebody restarting agents
-// by hand.
+// The failure it exists for is the one nothing else can see, and it has now
+// been watched three times. A pair stops working and never comes back. The
+// retry loop is running the whole time and every attempt is clean — a fresh
+// session, fresh ICE credentials, a fresh TURN client — and every attempt
+// fails. Then somebody restarts the agent and the same pair connects within a
+// second.
 //
-// Deliberately blunt and deliberately rare. It acts only when *no* peer has
-// been reachable for minutes, because a single peer that cannot be reached is
-// that peer's problem and reconnecting would fix nothing. And it acts at most
-// once a quarter of an hour, so a machine alone in a mesh does not spend its
-// life redialling.
+// Whatever is broken therefore is not in the attempt. It is in the one thing an
+// attempt does not rebuild and a restart does: the connection to the signalling
+// server. A socket that is open, answers every ping, and no longer carries this
+// machine's offers to that peer looks exactly like a NAT that cannot be
+// traversed, and no timeout fires because nothing has timed out.
+//
+// So: any peer stuck for minutes is enough. The first version of this waited
+// for *every* peer to be down, on the reasoning that one unreachable peer is
+// that peer's problem — which was wrong, and cost nine hours of one machine
+// being cut off while the panel showed six other tunnels working perfectly.
+//
+// Rate-limited, because the other reading is still possible: a peer that is
+// simply switched off will never connect, and this must not spend its life
+// redialling on behalf of a machine nobody has turned on. One reconnect a
+// quarter of an hour is cheap enough to be wrong about.
 func (e *Engine) watchdog(ctx context.Context) {
 	t := time.NewTicker(watchdogEvery)
 	defer t.Stop()
 
-	// Now, not zero: a machine that has just started has not failed at
-	// anything yet, and the first tick should not read as three minutes of
-	// silence.
-	lastGood := time.Now()
+	// When each peer was last seen connected. A peer that has never connected
+	// counts from the moment it was first noticed, not from zero: a machine
+	// that just started has not failed at anything yet.
+	lastGood := map[string]time.Time{}
 	var lastReset time.Time
 
 	for {
@@ -513,26 +521,53 @@ func (e *Engine) watchdog(ctx context.Context) {
 		case <-t.C:
 		}
 
-		total, connected := e.peerHealth()
-		if total == 0 || connected > 0 {
-			lastGood = time.Now()
+		now := time.Now()
+		var worst time.Duration
+		var worstPeer string
+
+		states := e.peerStates()
+		for key, connected := range states {
+			if connected {
+				lastGood[key] = now
+				continue
+			}
+			since, seen := lastGood[key]
+			if !seen {
+				lastGood[key] = now
+				continue
+			}
+			if d := now.Sub(since); d > worst {
+				worst, worstPeer = d, key
+			}
+		}
+		// Peers that are gone stop being watched.
+		for key := range lastGood {
+			if _, ok := states[key]; !ok {
+				delete(lastGood, key)
+			}
+		}
+
+		if worst < stuckAfter {
 			continue
 		}
-		if time.Since(lastGood) < stuckAfter {
+		if !lastReset.IsZero() && now.Sub(lastReset) < resetEvery {
 			continue
 		}
-		if !lastReset.IsZero() && time.Since(lastReset) < resetEvery {
-			continue
-		}
-		e.log.Warn("engine: no peer has connected for a while; reconnecting the signalling",
-			"peers", total, "for", time.Since(lastGood).Round(time.Second))
+		e.log.Warn("engine: a peer has been unreachable for a while; reconnecting the signalling",
+			"peer", short(mustKey(worstPeer)), "for", worst.Round(time.Second))
 		e.sig.Reset()
-		lastReset = time.Now()
+		// And cut short whatever backoff every stuck peer is sitting in. The
+		// reconnect is only worth anything if somebody tries again after it,
+		// and the peer that has been failing longest is also the one whose
+		// wait has climbed furthest — up to a quarter of a minute of doing
+		// nothing on a connection that has just been repaired.
+		e.wakeStuck()
+		lastReset = now
 	}
 }
 
-// peerHealth is how many peers there are and how many are up right now.
-func (e *Engine) peerHealth() (total, connected int) {
+// wakeStuck asks every peer that is not connected to try again now.
+func (e *Engine) wakeStuck() {
 	e.mu.Lock()
 	links := make([]*peerLink, 0, len(e.peers))
 	for _, l := range e.peers {
@@ -542,14 +577,45 @@ func (e *Engine) peerHealth() (total, connected int) {
 
 	for _, l := range links {
 		l.mu.Lock()
-		state := l.state
+		connected := l.state == p2p.StateConnected
 		l.mu.Unlock()
-		total++
-		if state == p2p.StateConnected {
-			connected++
+		if connected {
+			continue
+		}
+		select {
+		case l.wake <- struct{}{}:
+		default:
 		}
 	}
-	return total, connected
+}
+
+// peerStates is every peer and whether it is connected right now.
+func (e *Engine) peerStates() map[string]bool {
+	e.mu.Lock()
+	links := make(map[string]*peerLink, len(e.peers))
+	for key, l := range e.peers {
+		links[key] = l
+	}
+	e.mu.Unlock()
+
+	out := make(map[string]bool, len(links))
+	for key, l := range links {
+		l.mu.Lock()
+		out[key] = l.state == p2p.StateConnected
+		l.mu.Unlock()
+	}
+	return out
+}
+
+// mustKey is for logging a key this engine already holds. A key that does not
+// parse cannot be in the map, so the zero value is unreachable in practice and
+// harmless if it ever is.
+func mustKey(s string) wgtypes.Key {
+	k, err := wgtypes.ParseKey(s)
+	if err != nil {
+		return wgtypes.Key{}
+	}
+	return k
 }
 
 // SetAccessRules says what each peer may start against this machine.
