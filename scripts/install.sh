@@ -22,6 +22,16 @@
 set -eu
 
 REPO="rogerlovato2/netflow-agent"
+# Where an enrolled machine keeps who it is: /etc on Linux, /usr/local/etc on
+# macOS. Its presence is how this tells an upgrade from a first install, which
+# are two different things wearing the same command.
+identity=""
+for candidate in /etc/netflow/netflow.json /usr/local/etc/netflow/netflow.json; do
+	if [ -f "$candidate" ]; then
+		identity="$candidate"
+		break
+	fi
+done
 VERSION="${NETFLOW_VERSION:-latest}"
 BINDIR="${NETFLOW_BINDIR:-/usr/local/bin}"
 TARGET="$BINDIR/nfagent"
@@ -135,6 +145,30 @@ fi
 if [ "$#" -gt 0 ]; then
 	say ""
 	exec "$TARGET" install "$@"
+fi
+
+# A machine that is already on a mesh wanted an upgrade, not an introduction.
+#
+# Without this the script replaced the binary, printed instructions for joining
+# a mesh the machine is already in, and left the old process running — so
+# nothing changed until somebody restarted the service by hand, and the version
+# in the panel stayed where it was.
+if [ -n "$identity" ]; then
+	say ""
+	say "This machine is already on a mesh. Restarting the service so it runs the"
+	say "new binary."
+	if command -v systemctl >/dev/null 2>&1; then
+		systemctl restart netflow-agent || die "could not restart netflow-agent"
+	elif command -v launchctl >/dev/null 2>&1; then
+		launchctl kickstart -k system/cc.netflow.agent ||
+			die "could not restart the agent; try: sudo launchctl kickstart -k system/cc.netflow.agent"
+	else
+		say "No service manager found. Restart the agent yourself to pick this up."
+		exit 0
+	fi
+	say ""
+	say "Done. \`nfagent status\` says what it sees."
+	exit 0
 fi
 
 cat <<EOF
