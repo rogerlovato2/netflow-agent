@@ -15,13 +15,13 @@ func p(s string) netip.Prefix { return netip.MustParsePrefix(s) }
 // towards the networks this machine was given, and rewriting happens only for
 // the ones that asked for it.
 func TestTheRulesetForwardsOnlyWhatItWasGiven(t *testing.T) {
-	got := buildRouterRuleset("netflow0", sorted([]Route{
+	got := buildRouterRuleset("netflow0", p("100.90.0.0/22"), sorted([]Route{
 		{Network: p("192.168.1.0/24"), Masquerade: true},
 		{Network: p("10.20.0.0/16"), Masquerade: false},
 	}))
 
 	for _, want := range []string{
-		`iifname "netflow0" ip daddr { 10.20.0.0/16, 192.168.1.0/24 } accept`,
+		`iifname "netflow0" ip saddr 100.90.0.0/22 ip daddr { 10.20.0.0/16, 192.168.1.0/24 } accept`,
 		"ct state established,related accept",
 		"type nat hook postrouting priority srcnat",
 	} {
@@ -46,7 +46,7 @@ func TestTheRulesetForwardsOnlyWhatItWasGiven(t *testing.T) {
 // empty one: an empty set is a syntax error in nft, and a chain that exists to
 // hold nothing is a thing to explain later.
 func TestNoMasqueradeMeansNoNatChain(t *testing.T) {
-	got := buildRouterRuleset("netflow0", []Route{{Network: p("10.0.0.0/8")}})
+	got := buildRouterRuleset("netflow0", p("100.90.0.0/22"), []Route{{Network: p("10.0.0.0/8")}})
 	if strings.Contains(got, "postrouting") {
 		t.Errorf("a nat chain was written for nothing:\n%s", got)
 	}
@@ -55,11 +55,11 @@ func TestNoMasqueradeMeansNoNatChain(t *testing.T) {
 // The same routes in a different order produce the same ruleset, so a diff of
 // the firewall means the routes changed and not that a map arrived.
 func TestTheRulesetIsStable(t *testing.T) {
-	a := buildRouterRuleset("netflow0", sorted([]Route{
+	a := buildRouterRuleset("netflow0", p("100.90.0.0/22"), sorted([]Route{
 		{Network: p("192.168.1.0/24"), Masquerade: true},
 		{Network: p("10.20.0.0/16"), Masquerade: true},
 	}))
-	b := buildRouterRuleset("netflow0", sorted([]Route{
+	b := buildRouterRuleset("netflow0", p("100.90.0.0/22"), sorted([]Route{
 		{Network: p("10.20.0.0/16"), Masquerade: true},
 		{Network: p("192.168.1.0/24"), Masquerade: true},
 	}))
