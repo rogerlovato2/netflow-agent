@@ -297,7 +297,7 @@ func newer(target, current string) bool {
 	if a == nil || b == nil {
 		return false
 	}
-	for i := range 3 {
+	for i := range versionParts {
 		if a[i] != b[i] {
 			return a[i] > b[i]
 		}
@@ -305,13 +305,27 @@ func newer(target, current string) bool {
 	return false
 }
 
+// versionParts is how many numbers a version has, at most.
+//
+// Four, not three. The fourth is for the release that changes one thing and
+// wants to say so — v0.3.4.1 is a fix on top of v0.3.4, and calling it v0.3.5
+// would claim more than happened. Three-number versions are read as if their
+// fourth were zero, so v0.3.4 and v0.3.4.0 are the same release and the older
+// tags keep meaning what they meant.
+const versionParts = 4
+
 func parseVersion(v string) []int {
 	parts := strings.Split(strings.TrimPrefix(strings.TrimSpace(v), "v"), ".")
-	if len(parts) != 3 {
+	if len(parts) < 3 || len(parts) > versionParts {
 		return nil
 	}
-	out := make([]int, 3)
+	// Padded rather than rejected: the missing part is zero, which is what
+	// "v0.3.4" has always meant next to "v0.3.4.1".
+	out := make([]int, versionParts)
 	for i, p := range parts {
+		if p == "" {
+			return nil
+		}
 		n := 0
 		for _, c := range p {
 			if c < '0' || c > '9' {

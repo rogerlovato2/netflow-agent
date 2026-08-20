@@ -280,3 +280,37 @@ func TestAReadOnlyDirectorySaysWhatToDo(t *testing.T) {
 		t.Errorf("an unrelated error was rewritten: %v", got)
 	}
 }
+
+// Four numbers, because a release that changes one thing should be able to say
+// so. v0.3.4.1 is a fix on top of v0.3.4, and calling it v0.3.5 would claim
+// more than happened.
+//
+// Three-number versions are read as if their fourth were zero, so every tag
+// that already exists keeps meaning exactly what it meant.
+func TestFourNumberVersions(t *testing.T) {
+	for _, c := range []struct {
+		target, current string
+		want            bool
+	}{
+		{"v0.3.4.1", "v0.3.4", true},
+		{"v0.3.4", "v0.3.4.1", false},
+		{"v0.3.4.2", "v0.3.4.1", true},
+		{"v0.3.4.1", "v0.3.4.1", false},
+		{"v0.4.0", "v0.3.4.9", true},
+		{"v0.3.4.0", "v0.3.4", false},
+		{"v0.3.10.1", "v0.3.9.9", true},
+
+		// Still refuses what it cannot read, and still refuses to go
+		// backwards: an attacker who chooses which signed release a machine
+		// installs would otherwise pick the oldest one with a hole in it.
+		{"v0.3.4.1.1", "v0.3.4", false},
+		{"v0.3", "v0.3.4", false},
+		{"v0.3.4.", "v0.3.4", false},
+		{"v0.3.4.x", "v0.3.4", false},
+		{"v0.3.4.1", "dev", false},
+	} {
+		if got := newer(c.target, c.current); got != c.want {
+			t.Errorf("newer(%q, %q) = %v, want %v", c.target, c.current, got, c.want)
+		}
+	}
+}
