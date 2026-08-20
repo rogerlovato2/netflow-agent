@@ -374,3 +374,46 @@ func TestTURNCredentialsReachTheAgent(t *testing.T) {
 		t.Errorf("credentials did not reach the url: %+v", cfg.Urls[0])
 	}
 }
+
+// The relay is held back only when there is a relay, and the wait is the one
+// thing standing between a mesh on direct paths and a mesh paying a TURN server
+// for every byte: pion selects the first pair that works and never revisits the
+// choice, so this wait is not a delay before a decision, it is the decision.
+func TestRelayIsHeldBackOnlyWhenThereIsARelay(t *testing.T) {
+	cfg, err := agentConfig(Config{DisableSTUN: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.RelayAcceptanceMinWait != nil {
+		t.Fatalf("no TURN configured, yet the relay is held back for %v; every failing pair now waits that long to find out it failed",
+			*cfg.RelayAcceptanceMinWait)
+	}
+
+	cfg, err = agentConfig(Config{
+		DisableSTUN: true,
+		TURN:        []TURNServer{{URL: "turn:relay.example:3478", Username: "u", Password: "p"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.RelayAcceptanceMinWait == nil {
+		t.Fatal("a TURN server is configured and the relay is not held back at all: it wins every race against a hole punch, because its allocation is standing before the first check goes out")
+	}
+	if *cfg.RelayAcceptanceMinWait != defaultRelayWait {
+		t.Fatalf("relay held back for %v, want %v", *cfg.RelayAcceptanceMinWait, defaultRelayWait)
+	}
+
+	// And a caller that names its own wait gets it, which is how tests avoid
+	// spending eight seconds each to prove a fallback works.
+	cfg, err = agentConfig(Config{
+		DisableSTUN: true,
+		RelayWait:   50 * time.Millisecond,
+		TURN:        []TURNServer{{URL: "turn:relay.example:3478", Username: "u", Password: "p"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.RelayAcceptanceMinWait == nil || *cfg.RelayAcceptanceMinWait != 50*time.Millisecond {
+		t.Fatalf("RelayWait ignored: got %v", cfg.RelayAcceptanceMinWait)
+	}
+}

@@ -110,6 +110,11 @@ type Config struct {
 	// session is torn down and restarted. Zero takes the default below.
 	FailedTimeout time.Duration
 
+	// RelayWait is how long the relay is held back so a direct path can win the
+	// race. Zero takes defaultRelayWait, which is where the reasoning lives.
+	// Tests set it low so they do not spend eight seconds proving a fallback.
+	RelayWait time.Duration
+
 	// DisconnectedTimeout is how long a silent path is tolerated before it is
 	// called disconnected. A path can go quiet for a moment without being dead —
 	// a phone changing towers — so this is deliberately not the same as failed.
@@ -134,6 +139,31 @@ const (
 	defaultDisconnectedTimeout = 8 * time.Second
 	defaultFailedTimeout       = 60 * time.Second
 )
+
+// defaultRelayWait is how long the relay is held back so a direct path can win.
+//
+// ICE picks the first pair that works, and the relay's pair always works: the
+// allocation is already standing before the first check goes out, while a
+// direct pair still has to punch a hole through two NATs that have never seen
+// each other. Left alone, the race is not close.
+//
+// pion holds the relay back for two seconds for exactly this reason. Two
+// seconds is enough on a quiet link and is not enough here: a mesh of eighteen
+// machines negotiates its pairs in a burst, every agent punching to every other
+// agent at once, and the hole punch that would have landed at 2.3 seconds
+// arrives to find the question already settled.
+//
+// Settled permanently, which is the part that makes the number matter. Once a
+// pair is selected pion never nominates another — a direct path that becomes
+// available a moment later is not adopted, or reconsidered, ever. So this is
+// not a wait before a decision that can be revised. It is the whole of the
+// decision, and it was being made in two seconds.
+//
+// Eight, then. What it costs is the pairs that genuinely have no direct path:
+// they now take eight seconds to fall back to the relay instead of two. They
+// connect either way, and a peer that needs six more seconds once is a better
+// trade than a peer that pays for every byte it ever sends.
+const defaultRelayWait = 8 * time.Second
 
 // TURNServer is a relay of last resort.
 type TURNServer struct {
@@ -317,6 +347,17 @@ func agentConfig(c Config) (*ice.AgentConfig, error) {
 		disconnected = defaultDisconnectedTimeout
 	}
 	cfg.DisconnectedTimeout = &disconnected
+
+	// Only when there is somewhere to fall back to. With no TURN configured
+	// there is no relay candidate to hold back, and holding one back would mean
+	// every pair that fails waits eight seconds to learn it has failed.
+	if len(c.TURN) > 0 {
+		relayWait := c.RelayWait
+		if relayWait <= 0 {
+			relayWait = defaultRelayWait
+		}
+		cfg.RelayAcceptanceMinWait = &relayWait
+	}
 
 	return cfg, nil
 }
