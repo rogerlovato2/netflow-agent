@@ -187,6 +187,14 @@ type peerLink struct {
 	// signalling problem. Nine hours went into the wrong one of those.
 	lastErr   string
 	lastErrAt time.Time
+	// abandonWhy is why this engine ended the attempt itself, when it did.
+	//
+	// Without it every deliberate cancellation reads as "connecting canceled by
+	// caller", which is true and useless: the peer saying goodbye, the peer
+	// restarting its negotiation and the peer being moved to a new address all
+	// produce that sentence, and they are three different things to go and look
+	// at.
+	abandonWhy string
 	// early holds signalling that arrived before there was a session to give it
 	// to, replayed in order the moment one exists.
 	early []signal.Message
@@ -767,12 +775,18 @@ func (e *Engine) keepPeerConnected(ctx context.Context, link *peerLink) {
 				"peer", short(link.spec.PublicKey), "err", err, "retry_in", delay)
 		}
 		link.mu.Lock()
-		if err != nil {
-			link.lastErr, link.lastErrAt = err.Error(), time.Now()
-		} else {
+		switch {
+		case err == nil:
 			// A connection that lasted answers the question by existing.
 			link.lastErr, link.lastErrAt = "", time.Time{}
+		case link.abandonWhy != "":
+			// This engine ended it on purpose. Saying so beats reporting the
+			// cancellation, which is the symptom of every deliberate stop.
+			link.lastErr, link.lastErrAt = link.abandonWhy, time.Now()
+		default:
+			link.lastErr, link.lastErrAt = err.Error(), time.Now()
 		}
+		link.abandonWhy = ""
 		link.mu.Unlock()
 
 		select {
@@ -1036,6 +1050,7 @@ func (e *Engine) dispatch(m signal.Message) {
 			"peer", short(m.From))
 		link.mu.Lock()
 		abandon := link.attemptCancel
+		link.abandonWhy = "the peer restarted its negotiation"
 		link.mu.Unlock()
 		if abandon != nil {
 			abandon()
@@ -1064,6 +1079,7 @@ func (e *Engine) dispatch(m signal.Message) {
 		e.log.Debug("engine: peer said goodbye", "peer", short(m.From))
 		link.mu.Lock()
 		leaving := link.attemptCancel
+		link.abandonWhy = "the peer said goodbye (restarting or shutting down)"
 		link.mu.Unlock()
 		if leaving != nil {
 			leaving()
