@@ -1010,11 +1010,28 @@ func (e *Engine) dispatch(m signal.Message) {
 		if sess.SetRemoteCredentials(m.Body.UFrag, m.Body.Pwd) {
 			return
 		}
-		// The peer is on a newer attempt than this session can join. Abandoning
-		// ours sends the retry loop straight into a fresh one, which is the only
-		// thing that converges: left alone, both ends keep checking with
-		// credentials the other has already discarded and neither ever fails
-		// fast enough to notice.
+		// The peer is on a newer attempt than this session can join, and only
+		// one of the two sides may follow the other.
+		//
+		// Both following is a livelock, and it was the bug. A's new offer made
+		// B abandon and re-offer; B's new offer made A abandon and re-offer;
+		// each abandonment produced the credentials that caused the next one.
+		// Two machines spun against each other for hours, every attempt dying
+		// as "connecting canceled by caller", while the panel showed a pair
+		// that would not connect and every log said the network was fine. A
+		// restart of either side broke the symmetry for one moment, which is
+		// why restarting always looked like the cure.
+		//
+		// The side that follows is the one that answers, decided by the same
+		// tie-break that already decides who offers — so both ends agree
+		// without exchanging anything. The offering side holds its attempt and
+		// lets its own timeout end it, which converges: one of them stays
+		// still long enough to be met.
+		if sess.Controlling() {
+			e.log.Debug("engine: peer re-offered while we are offering; holding",
+				"peer", short(m.From))
+			return
+		}
 		e.log.Debug("engine: peer restarted its negotiation, following it",
 			"peer", short(m.From))
 		link.mu.Lock()
