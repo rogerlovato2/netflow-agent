@@ -24,7 +24,7 @@ WAILS_PLATFORM ?= darwin/$(shell go env GOARCH)
 # from the Finder and confirms. That is the deal until there is a developer
 # account, and it is enough for a client that is installed by the same person
 # who built it.
-app:
+app: _outside
 	-$(WAILS) build -clean -platform $(WAILS_PLATFORM) -ldflags "-X main.version=$(VERSION)"
 	@test -x $(APP)/Contents/MacOS/netflow || \
 		{ echo "the build did not produce a binary; the error above is real"; exit 1; }
@@ -51,6 +51,21 @@ install: app
 	cp -R $(APP) /Applications/netflow.app
 	@echo "installed /Applications/netflow.app"
 
+# _outside puts the build output where the sync cannot reach it.
+#
+# This project lives in a synced folder, and the sync attaches its own extended
+# attributes to everything written there — including a bundle being built.
+# codesign refuses a bundle carrying them, and clearing them first is a race
+# against a daemon: it reattaches within milliseconds of the next write, so the
+# build failed roughly every other time and for no reason anybody could see.
+#
+# So build/bin is a link to somewhere outside. Nothing is lost — it is output,
+# ignored by git, and rebuilt from nothing every time.
+.PHONY: _outside
+_outside:
+	@mkdir -p "$(TMPDIR)netflow-bin"
+	@if [ ! -L build/bin ]; then rm -rf build/bin; ln -s "$(TMPDIR)netflow-bin" build/bin; fi
+
 # dmg packages the bundle for another Mac.
 #
 # A disk image and not an installer package: a .pkg that is not signed is
@@ -73,11 +88,8 @@ dmg: app
 
 # dev runs it with a live frontend. It signs on every rebuild, so it needs the
 # bundle somewhere the sync does not reach.
-dev:
-	@mkdir -p $(TMPDIR)netflow-bin
-	@rm -rf build/bin && ln -s $(TMPDIR)netflow-bin build/bin
+dev: _outside
 	$(WAILS) dev -ldflags "-X main.version=$(VERSION)"
-	@rm -f build/bin
 
 # icon redraws build/appicon.png, which wails turns into the bundle's iconset.
 # Only needed when the mark changes; the result is checked in.
