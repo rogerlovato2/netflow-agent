@@ -1,11 +1,14 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
+	"time"
 )
 
 // installedBinary is where the service will expect to find this program.
@@ -40,14 +43,33 @@ func install(args []string) error {
 	// system. The reverse order leaves a service installed for a machine that
 	// never joined, which starts, fails, restarts, and fills the log.
 	cfg, err := loadConfig(*path)
-	if err != nil || cfg.PrivateKey == "" {
+	switch {
+	case err != nil || cfg.PrivateKey == "":
 		if *setupKey == "" || *server == "" {
 			return errors.New("this machine has not joined a mesh yet: install needs --setup-key and --server")
 		}
 		if cfg, err = enrol(*server, *setupKey, *name, *path); err != nil {
 			return err
 		}
-	} else {
+
+	case *setupKey != "" && !stillAMember(cfg):
+		// There is an identity, a key was given, and the server does not know
+		// this machine any more.
+		//
+		// That last part is the whole test. Reinstalling normally should come
+		// back as the same machine — same address, same place in everybody's
+		// policies — so an identity is not thrown away because somebody passed
+		// a key. But an identity the server has forgotten is not an identity:
+		// its token is refused, no map ever arrives, and the machine sits there
+		// talking to a mesh that has moved on. Which is exactly what happened
+		// after the mesh here was rebuilt, and the way out was to know about
+		// `uninstall --purge`.
+		fmt.Printf("the server no longer knows this machine (%s); joining again\n", cfg.Address)
+		if cfg, err = enrol(*server, *setupKey, *name, *path); err != nil {
+			return err
+		}
+
+	default:
 		fmt.Printf("already a member as %s\n", cfg.Address)
 	}
 
@@ -73,6 +95,29 @@ func install(args []string) error {
 	fmt.Printf("  identity %s\n", *path)
 	fmt.Printf("  binary   %s\n", binary)
 	return nil
+}
+
+// stillAMember asks the server whether this machine's identity is any good.
+//
+// Only ever used to decide whether to enrol again, and only when a setup key
+// was given — so a server that is down, or a laptop with no network, answers
+// "yes, still a member" and nothing is thrown away. Being wrong in that
+// direction costs a reinstall that does nothing; being wrong in the other
+// costs the machine its address and its place in every policy.
+func stillAMember(cfg *Config) bool {
+	if cfg.Server == "" || cfg.Token == "" {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if _, err := fetchMap(ctx, cfg); err == nil {
+		return true
+	} else if !strings.Contains(err.Error(), "401") {
+		// Anything that is not a refusal is not an answer: the server may be
+		// unreachable, and an identity is too expensive to discard on a guess.
+		return true
+	}
+	return false
 }
 
 // uninstall stops the service and removes it.
