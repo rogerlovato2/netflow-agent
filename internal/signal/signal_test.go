@@ -544,3 +544,32 @@ func TestClientDetectsASilentlyDeadPath(t *testing.T) {
 	proxy.frozen.Store(true)
 	waitUntil(t, "the client to notice the silence", func() bool { return !c.Connected() })
 }
+
+// Reset dials again, and messages still arrive afterwards.
+//
+// The failure it exists for is a socket that is open and useless — a server
+// restarted or upgraded under a running agent, answering pings and relaying
+// nothing. No timeout fires, because nothing has timed out. Something that can
+// tell the difference has to be able to say "start over", and what it gets back
+// has to be a working client and not a shell of one.
+func TestResetReconnectsAndKeepsWorking(t *testing.T) {
+	srv, url := testServer(t)
+	aPriv, _ := keypair(t)
+	bPriv, _ := keypair(t)
+	a, _ := testClient(t, url, aPriv)
+	_, gotB := testClient(t, url, bPriv)
+
+	waitUntil(t, "both clients on the server", func() bool { return srv.Peers() == 2 })
+
+	a.Reset()
+	waitUntil(t, "the client to notice it is down", func() bool { return !a.Connected() })
+	waitUntil(t, "the client to come back", a.Connected)
+	waitUntil(t, "the server to have both again", func() bool { return srv.Peers() == 2 })
+
+	if err := a.Send(bPriv.PublicKey(), KindOffer, Body{UFrag: "afterReset", Pwd: "afterTheResetLong"}); err != nil {
+		t.Fatal(err)
+	}
+	if m := recv(t, gotB); m.Body.UFrag != "afterReset" {
+		t.Errorf("after a reset the message arrived as %q", m.Body.UFrag)
+	}
+}

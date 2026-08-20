@@ -107,7 +107,7 @@ type Config struct {
 	LoggerFactory logging.LoggerFactory
 
 	// FailedTimeout is how long a connection may stay unreachable before the
-	// session is torn down and restarted. Zero takes the pion default.
+	// session is torn down and restarted. Zero takes the default below.
 	FailedTimeout time.Duration
 
 	// DisconnectedTimeout is how long a silent path is tolerated before it is
@@ -115,6 +115,25 @@ type Config struct {
 	// a phone changing towers — so this is deliberately not the same as failed.
 	DisconnectedTimeout time.Duration
 }
+
+// How long a path may be silent before it is given up on.
+//
+// pion's own defaults are five seconds to disconnected and twenty-five to
+// failed, which are the numbers for a browser call: a person is watching, and
+// half a minute of nothing is worse than starting over. A mesh is the opposite.
+// Nobody is watching, the link is a home connection or a phone or a shop in
+// another state, and half a minute of loss is a Tuesday. Giving up costs a full
+// renegotiation — new credentials, new candidates, new checks — and the tunnel
+// is down for all of it.
+//
+// So: a path is called disconnected quickly, because that costs nothing and
+// makes the panel honest, and it is not failed for a minute. ICE keeps probing
+// the whole time at its own two-second cadence, so a path that comes back is
+// simply used again, with no renegotiation and nothing above it noticing.
+const (
+	defaultDisconnectedTimeout = 8 * time.Second
+	defaultFailedTimeout       = 60 * time.Second
+)
 
 // TURNServer is a relay of last resort.
 type TURNServer struct {
@@ -287,13 +306,17 @@ func agentConfig(c Config) (*ice.AgentConfig, error) {
 		// relay to gather from.
 		CandidateTypes: candidateTypes(c),
 	}
-	if c.FailedTimeout > 0 {
-		d := c.FailedTimeout
-		cfg.FailedTimeout = &d
+	failed := c.FailedTimeout
+	if failed <= 0 {
+		failed = defaultFailedTimeout
 	}
-	if c.DisconnectedTimeout > 0 {
-		d := c.DisconnectedTimeout
-		cfg.DisconnectedTimeout = &d
+	cfg.FailedTimeout = &failed
+
+	disconnected := c.DisconnectedTimeout
+	if disconnected <= 0 {
+		disconnected = defaultDisconnectedTimeout
 	}
+	cfg.DisconnectedTimeout = &disconnected
+
 	return cfg, nil
 }

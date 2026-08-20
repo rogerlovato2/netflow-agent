@@ -30,7 +30,16 @@ const (
 	// quick retry wins, or because it is off for the weekend, in which case
 	// anything short is just noise on the signal server.
 	retryMin = 2 * time.Second
-	retryMax = 60 * time.Second
+	// retryMax is how far the backoff is allowed to climb.
+	//
+	// It was a minute, which is the right ceiling for something that costs the
+	// other end to attempt. This costs nothing anyone else notices: two
+	// machines that cannot reach each other are the only ones involved, and the
+	// attempt is a handful of packets. A minute of waiting is a minute of a
+	// tunnel being down after the reason it was down has passed — and the peer
+	// coming back is precisely when the wait is longest, because that is when
+	// the backoff has climbed furthest.
+	retryMax = 15 * time.Second
 
 	// negotiateTimeout bounds one attempt.
 	//
@@ -240,6 +249,7 @@ func (e *Engine) SignalConnected() bool { return e.sig.Connected() }
 func (e *Engine) Run(ctx context.Context) error {
 	e.sig.OnMessage(e.dispatch)
 	go e.sig.Run(ctx)
+	go e.watchdog(ctx)
 
 	<-ctx.Done()
 	e.closeAllPeers()
@@ -433,6 +443,96 @@ func (e *Engine) Goodbye() {
 			e.log.Debug("engine: could not say goodbye", "peer", short(k), "err", err)
 		}
 	}
+}
+
+// How the watchdog decides something is wrong, and how often it may act.
+const (
+	// watchdogEvery is how often the question is asked. Cheap: it reads state
+	// the engine already keeps.
+	watchdogEvery = 30 * time.Second
+
+	// stuckAfter is how long every peer must have been unreachable before the
+	// signalling is suspected. Long enough that an ordinary renegotiation, a
+	// reboot at the other end, or a minute of bad network is not it.
+	stuckAfter = 3 * time.Minute
+
+	// resetEvery bounds how often the signalling may be reconnected. A mesh
+	// where nobody is switched on is indistinguishable from one where the
+	// signalling is broken, and it must not turn into a reconnect every three
+	// minutes forever.
+	resetEvery = 15 * time.Minute
+)
+
+// watchdog reconnects the signalling when nothing has connected for a while.
+//
+// The failure it exists for is the one nothing else can see: a socket that is
+// open, answers every ping, and delivers nothing — a signal server that was
+// restarted or upgraded underneath a running agent. Every negotiation then
+// fails the way a NAT problem fails, no timeout fires because nothing has timed
+// out, and the retry loop tries forever against a server that will never
+// answer. That is a whole afternoon of a mesh being down with every log saying
+// it is fine, and the only thing that fixed it was somebody restarting agents
+// by hand.
+//
+// Deliberately blunt and deliberately rare. It acts only when *no* peer has
+// been reachable for minutes, because a single peer that cannot be reached is
+// that peer's problem and reconnecting would fix nothing. And it acts at most
+// once a quarter of an hour, so a machine alone in a mesh does not spend its
+// life redialling.
+func (e *Engine) watchdog(ctx context.Context) {
+	t := time.NewTicker(watchdogEvery)
+	defer t.Stop()
+
+	// Now, not zero: a machine that has just started has not failed at
+	// anything yet, and the first tick should not read as three minutes of
+	// silence.
+	lastGood := time.Now()
+	var lastReset time.Time
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+
+		total, connected := e.peerHealth()
+		if total == 0 || connected > 0 {
+			lastGood = time.Now()
+			continue
+		}
+		if time.Since(lastGood) < stuckAfter {
+			continue
+		}
+		if !lastReset.IsZero() && time.Since(lastReset) < resetEvery {
+			continue
+		}
+		e.log.Warn("engine: no peer has connected for a while; reconnecting the signalling",
+			"peers", total, "for", time.Since(lastGood).Round(time.Second))
+		e.sig.Reset()
+		lastReset = time.Now()
+	}
+}
+
+// peerHealth is how many peers there are and how many are up right now.
+func (e *Engine) peerHealth() (total, connected int) {
+	e.mu.Lock()
+	links := make([]*peerLink, 0, len(e.peers))
+	for _, l := range e.peers {
+		links = append(links, l)
+	}
+	e.mu.Unlock()
+
+	for _, l := range links {
+		l.mu.Lock()
+		state := l.state
+		l.mu.Unlock()
+		total++
+		if state == p2p.StateConnected {
+			connected++
+		}
+	}
+	return total, connected
 }
 
 // SetAccessRules says what each peer may start against this machine.

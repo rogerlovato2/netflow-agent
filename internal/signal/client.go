@@ -77,6 +77,8 @@ type Client struct {
 	mu      sync.RWMutex
 	handler func(Message)
 	up      bool
+	// drop ends the live session. See Reset.
+	drop context.CancelFunc
 }
 
 func NewClient(url string, priv wgtypes.Key, log *slog.Logger) *Client {
@@ -192,6 +194,27 @@ func (c *Client) Run(ctx context.Context) {
 	}
 }
 
+// Reset ends the current session so the next one is dialled fresh.
+//
+// The socket can be alive and useless. The ping proves the path is there and
+// proves nothing about the server on the other end of it: one that has been
+// restarted, or upgraded, or has quietly stopped relaying for this key, answers
+// every ping and delivers nothing. From here that looks exactly like a mesh
+// where nobody wants to talk, and no timeout will ever fire.
+//
+// So something that can tell the difference — the engine, which knows whether
+// any peer has connected lately — gets to say "try that again from scratch".
+// Reconnecting costs one websocket and disturbs no tunnel that is already up.
+func (c *Client) Reset() {
+	c.mu.Lock()
+	drop := c.drop
+	c.mu.Unlock()
+	if drop != nil {
+		c.log.Info("signal: reconnecting on request")
+		drop()
+	}
+}
+
 // session runs one socket from dial to death.
 func (c *Client) session(ctx context.Context) error {
 	dialCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
@@ -205,6 +228,15 @@ func (c *Client) session(ctx context.Context) error {
 
 	ctx, stop := context.WithCancel(ctx)
 	defer stop()
+
+	c.mu.Lock()
+	c.drop = stop
+	c.mu.Unlock()
+	defer func() {
+		c.mu.Lock()
+		c.drop = nil
+		c.mu.Unlock()
+	}()
 
 	hello, err := json.Marshal(Envelope{Kind: KindHello, From: c.pub.String()})
 	if err != nil {
