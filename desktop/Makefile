@@ -29,8 +29,16 @@ app:
 	@test -x $(APP)/Contents/MacOS/netflow || \
 		{ echo "the build did not produce a binary; the error above is real"; exit 1; }
 	xattr -cr $(APP)
+	@# The version goes into the bundle as well as into the binary. wails takes
+	@# it from wails.json, which cannot know what git describe said — so the
+	@# Info.plist claimed 0.0.0 forever, and the Finder, the About box and
+	@# anything that inspects an application saw a version that never changed.
+	/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $(VERSION)" 		$(APP)/Contents/Info.plist
+	/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $(VERSION)" 		$(APP)/Contents/Info.plist
+	@# Signed after, because changing a file inside a signed bundle breaks the
+	@# signature — which is the whole point of one.
 	codesign --force --deep --sign - $(APP)
-	@echo "built $(APP)"
+	@echo "built $(APP) ($(VERSION))"
 
 # install puts the built bundle where the Finder, Spotlight and the Dock look
 # for it. Replaces whatever is there, so it is also how an update is applied.
