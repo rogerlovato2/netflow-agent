@@ -26,6 +26,7 @@ import (
 	"github.com/pion/logging"
 	"github.com/rogerlovato2/netflow-agent/internal/engine"
 	"github.com/rogerlovato2/netflow-agent/internal/p2p"
+	"github.com/rogerlovato2/netflow-agent/internal/router"
 	"github.com/rogerlovato2/netflow-agent/internal/tunnel"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
@@ -304,9 +305,21 @@ func up(args []string) error {
 	if len(peers) > 0 {
 		eng.SetPeers(ctx, peers)
 	}
+
+	// What this machine carries for the rest of the mesh, if anything. Closed
+	// on the way out: a machine that stops being an agent should stop being a
+	// router in the same breath, rather than leaving forwarding switched on and
+	// a NAT rule pointing at an interface that is gone.
+	rt := router.New()
+	defer func() {
+		if err := rt.Close(); err != nil {
+			log.Warn("could not put the routing rules back", "err", err)
+		}
+	}()
+
 	if cfg.Server != "" && cfg.Token != "" {
 		log.Info("following the network map", "server", cfg.Server, "cached_peers", len(peers))
-		go followTheMap(ctx, eng, cfg, *path, log)
+		go followTheMap(ctx, eng, cfg, rt, *path, log)
 		go reportToServer(ctx, eng, cfg, log)
 	}
 

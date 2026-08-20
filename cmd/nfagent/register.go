@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/rogerlovato2/netflow-agent/internal/engine"
+	"github.com/rogerlovato2/netflow-agent/internal/router"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
 
@@ -123,6 +124,10 @@ func machineFacts() map[string]string {
 		// that has never tried reports.
 		"updateError":   updateError(),
 		"firewallError": firewallError(),
+		// Why this machine could not carry the networks it was given, in its
+		// own words. A router that silently fails to forward is one somebody
+		// debugs from the far end, wondering why a printer stopped answering.
+		"routingError": RoutingError(),
 	}
 }
 
@@ -253,6 +258,20 @@ type networkMap struct {
 	// can ask; it cannot say where the binary comes from, and it cannot make an
 	// unsigned one acceptable. Absent means no.
 	Update *updatePolicy `json:"update,omitempty"`
+	// Advertise is the networks this machine carries for the rest of the mesh.
+	// Empty for almost every machine: being a router is a job somebody gives
+	// one of them, in the panel.
+	Advertise []advertisedRoute `json:"advertise,omitempty"`
+}
+
+// advertisedRoute is one network this machine forwards for.
+type advertisedRoute struct {
+	Network string `json:"network"`
+	// Masquerade rewrites the source as traffic leaves towards the network.
+	// Almost always on: the machines behind it have never heard of the mesh and
+	// would answer a mesh address by asking their gateway, which has not heard
+	// of it either.
+	Masquerade bool `json:"masquerade"`
 }
 
 // updatePolicy is the whole of what the server is allowed to decide.
@@ -362,7 +381,7 @@ func UpdatePolicy() *updatePolicy {
 // A failed poll is logged and nothing else: the peers already configured keep
 // working, which is the behaviour worth having — a management server that is
 // down should cost new machines, not existing tunnels.
-func followTheMap(ctx context.Context, eng *engine.Engine, cfg *Config, path string, log *slog.Logger) {
+func followTheMap(ctx context.Context, eng *engine.Engine, cfg *Config, rt router.Router, path string, log *slog.Logger) {
 	t := time.NewTicker(mapEvery)
 	defer t.Stop()
 
@@ -491,6 +510,8 @@ func followTheMap(ctx context.Context, eng *engine.Engine, cfg *Config, path str
 						log.Warn("could not save the network map", "err", err)
 					}
 				}
+				applyAdvertised(rt, eng, cfg, m.Advertise, log)
+
 				if paused.Load() {
 					// The map is still followed and still saved — only not
 					// applied. Reconnecting then costs nothing but a call.
@@ -607,6 +628,84 @@ func firewallError() string {
 }
 
 // applyAccessRules hands the engine what each peer may start.
+// applyAdvertised makes this machine forward for what the server asked, and
+// stop forwarding for anything it did not.
+//
+// The whole list every time, including an empty one. A machine that was a
+// router and is not any more has to stop being one, and the only way to know
+// that from a list of what it should carry is to act on the whole list.
+func applyAdvertised(rt router.Router, eng *engine.Engine, cfg *Config,
+	advertised []advertisedRoute, log *slog.Logger) {
+	routes := make([]router.Route, 0, len(advertised))
+	for _, a := range advertised {
+		prefix, err := netip.ParsePrefix(a.Network)
+		if err != nil {
+			log.Warn("the server sent a network that does not parse",
+				"network", a.Network, "err", err)
+			continue
+		}
+		routes = append(routes, router.Route{Network: prefix, Masquerade: a.Masquerade})
+	}
+
+	// Nothing asked for and nothing configured: the common case, and worth not
+	// touching the firewall for.
+	if len(routes) == 0 && !routing.Load() {
+		return
+	}
+
+	mesh, err := netip.ParsePrefix(cfg.Subnet)
+	if err != nil {
+		// Without the mesh's own prefix there is no way to tell traffic that
+		// arrived over the tunnel from this machine's own, and rules that
+		// cannot tell them apart would rewrite both.
+		log.Warn("cannot carry a network without knowing the mesh subnet",
+			"subnet", cfg.Subnet, "err", err)
+		return
+	}
+
+	if err := rt.Apply(eng.Device().Name(), mesh, routes); err != nil {
+		setRoutingError(err)
+		log.Warn("could not carry the networks the server asked for", "err", err)
+		return
+	}
+	setRoutingError(nil)
+	routing.Store(len(routes) > 0)
+	if len(routes) > 0 {
+		log.Info("carrying networks for the mesh", "count", len(routes))
+	} else {
+		log.Info("no longer carrying any network for the mesh")
+	}
+}
+
+// routing is whether this machine currently forwards for anything, so that
+// going back to none is applied once rather than on every poll.
+var routing atomic.Bool
+
+// lastRoutingError is why this machine could not carry what it was asked to,
+// in its own words, for the panel to show. A machine that silently fails to
+// forward is one somebody debugs from the far end.
+var lastRoutingError struct {
+	sync.Mutex
+	value string
+}
+
+func setRoutingError(err error) {
+	lastRoutingError.Lock()
+	defer lastRoutingError.Unlock()
+	if err == nil {
+		lastRoutingError.value = ""
+		return
+	}
+	lastRoutingError.value = err.Error()
+}
+
+// RoutingError is the last reason this machine could not carry a network.
+func RoutingError() string {
+	lastRoutingError.Lock()
+	defer lastRoutingError.Unlock()
+	return lastRoutingError.value
+}
+
 func applyAccessRules(eng *engine.Engine, peers []PeerConfig, log *slog.Logger) {
 	rules := make(map[netip.Addr][]filter.Rule, len(peers))
 	for _, p := range peers {

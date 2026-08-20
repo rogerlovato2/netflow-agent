@@ -304,13 +304,7 @@ func (e *Engine) SetPeers(ctx context.Context, peers []Peer) {
 		e.peers[key] = link
 		starting = append(starting, link)
 
-		// A route per peer, only when there is no route for the whole mesh.
-		// With one, these would be five hundred more specific entries saying
-		// what the one already says.
-		if !e.routesPerPeer() {
-			continue
-		}
-		for _, a := range spec.AllowedIPs {
+		for _, a := range e.routesTo(spec) {
 			if rerr := e.dev.AddRoute(a); rerr != nil {
 				e.log.Warn("engine: could not route to a peer",
 					"peer", short(spec.PublicKey), "prefix", a, "err", rerr)
@@ -371,9 +365,32 @@ func (e *Engine) readdress(prev, next Peer) {
 // routesPerPeer is false when one route covers the whole mesh.
 func (e *Engine) routesPerPeer() bool { return !e.cfg.Subnet.IsValid() }
 
+// routesTo is which of a peer's allowed prefixes need a route of their own.
+//
+// Its mesh address usually needs none: one route covers the whole mesh, and
+// five hundred more specific entries saying what that one already says is a
+// routing table nobody can read and a reconcile that has to get every one of
+// them right.
+//
+// A network the peer carries for somebody else is the exception, and always
+// needs one. It is not inside the mesh — that is the entire point of it — so
+// nothing else in the table sends it anywhere, and without this the packet
+// leaves by the default route and reaches a machine on the internet that has
+// never heard of it.
+func (e *Engine) routesTo(spec Peer) []netip.Prefix {
+	var out []netip.Prefix
+	for _, a := range spec.AllowedIPs {
+		if e.routesPerPeer() || !e.cfg.Subnet.Overlaps(a) {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
 func (e *Engine) rerouteAllowedIPs(prev, next Peer) {
-	for _, a := range prev.AllowedIPs {
-		if containsPrefix(next.AllowedIPs, a) {
+	was, now := e.routesTo(prev), e.routesTo(next)
+	for _, a := range was {
+		if containsPrefix(now, a) {
 			continue
 		}
 		if err := e.dev.DelRoute(a); err != nil {
@@ -381,8 +398,8 @@ func (e *Engine) rerouteAllowedIPs(prev, next Peer) {
 				"peer", short(next.PublicKey), "prefix", a, "err", err)
 		}
 	}
-	for _, a := range next.AllowedIPs {
-		if containsPrefix(prev.AllowedIPs, a) {
+	for _, a := range now {
+		if containsPrefix(was, a) {
 			continue
 		}
 		if err := e.dev.AddRoute(a); err != nil {
