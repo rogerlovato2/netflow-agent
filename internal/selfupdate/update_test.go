@@ -314,3 +314,24 @@ func TestFourNumberVersions(t *testing.T) {
 		}
 	}
 }
+
+// A binary whose version cannot be read is refused, and says so.
+//
+// Refusing is right: replacing something somebody built by hand would quietly
+// undo whatever it was built for. But it used to be reported the same way as
+// being up to date, so the panel said nothing and the button did nothing —
+// twice, to somebody who then asked me why. Silence is the wrong answer to
+// "why did that not work".
+func TestARunningVersionThatCannotBeReadIsRefusedOutLoud(t *testing.T) {
+	for _, current := range []string{"dev", "v0.3.3-dev", "", "banana", "v0.3"} {
+		_, err := Apply(t.Context(), "v0.3.4.6", current, quiet())
+		if !errors.Is(err, ErrUnknownVersion) {
+			t.Errorf("running %q gave %v, want ErrUnknownVersion", current, err)
+		}
+		// The version is in the message, because the first question is always
+		// "what does it think it is running".
+		if err != nil && current != "" && !strings.Contains(err.Error(), current) {
+			t.Errorf("running %q, the error does not name it: %v", current, err)
+		}
+	}
+}

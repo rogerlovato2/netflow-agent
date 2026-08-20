@@ -37,6 +37,14 @@ var (
 	ErrNoAsset     = errors.New("the release has no build for this machine")
 	ErrWrongDigest = errors.New("the downloaded file does not match the release's checksum")
 	ErrNotNewer    = errors.New("the release is not newer than what is running")
+	// ErrUnknownVersion is a running binary whose version cannot be read: a
+	// hand-built one, or a tag this build predates.
+	//
+	// Refusing is right — replacing a binary somebody built to test would
+	// quietly undo whatever it was built for — but it used to be indistinguish-
+	// able from being up to date, so the panel said nothing and the button did
+	// nothing. Silence is the wrong answer to "why did that not work".
+	ErrUnknownVersion = errors.New("cannot tell what version is running, so refusing to replace it")
 )
 
 // httpClient has a timeout because the alternative is an update check that
@@ -127,6 +135,12 @@ func Apply(ctx context.Context, target, current string, log *slog.Logger) (bool,
 			return false, fmt.Errorf("looking for the newest release: %w", err)
 		}
 		target = found
+	}
+	// Told apart on purpose. One is a machine that is fine and the other is a
+	// machine nothing will ever update, and they used to report the same
+	// nothing.
+	if current == "dev" || parseVersion(current) == nil {
+		return false, fmt.Errorf("%w (running %q)", ErrUnknownVersion, current)
 	}
 	if !newer(target, current) {
 		return false, ErrNotNewer

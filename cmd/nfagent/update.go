@@ -3,12 +3,12 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
+	"github.com/rogerlovato2/netflow-agent/internal/engine"
+	"github.com/rogerlovato2/netflow-agent/internal/selfupdate"
 	"log/slog"
 	"sync"
 	"time"
-
-	"github.com/rogerlovato2/netflow-agent/internal/engine"
-	"github.com/rogerlovato2/netflow-agent/internal/selfupdate"
 )
 
 // How often a machine looks for a newer release once it has been told it may.
@@ -76,6 +76,13 @@ func considerUpdate(ctx context.Context, eng *engine.Engine, cfg *Config, policy
 	case errors.Is(err, selfupdate.ErrNotNewer):
 		// The ordinary state of an up-to-date machine, and not a failure.
 		setUpdateError(nil)
+		return
+	case errors.Is(err, selfupdate.ErrUnknownVersion):
+		// Reported rather than swallowed. This machine will never update from
+		// the panel, and somebody pressing the button deserves to be told that
+		// instead of watching nothing happen twice.
+		setUpdateError(fmt.Errorf("%w — install it by hand", err))
+		log.Warn("update: refused", "err", err)
 		return
 	case err != nil:
 		setUpdateError(err)
