@@ -28,7 +28,6 @@ app:
 	-$(WAILS) build -clean -platform $(WAILS_PLATFORM) -ldflags "-X main.version=$(VERSION)"
 	@test -x $(APP)/Contents/MacOS/netflow || \
 		{ echo "the build did not produce a binary; the error above is real"; exit 1; }
-	xattr -cr $(APP)
 	@# The version goes into the bundle as well as into the binary. wails takes
 	@# it from wails.json, which cannot know what git describe said — so the
 	@# Info.plist claimed 0.0.0 forever, and the Finder, the About box and
@@ -37,6 +36,11 @@ app:
 	/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $(VERSION)" 		$(APP)/Contents/Info.plist
 	@# Signed after, because changing a file inside a signed bundle breaks the
 	@# signature — which is the whole point of one.
+	@# Cleared last, and after every write above. This project lives in a
+	@# synced folder, and the sync reattaches its own extended attributes to
+	@# any file that is touched — including the Info.plist edited just now,
+	@# which is why clearing them any earlier was not enough.
+	xattr -cr $(APP)
 	codesign --force --deep --sign - $(APP)
 	@echo "built $(APP) ($(VERSION))"
 
