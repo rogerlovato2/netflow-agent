@@ -1,14 +1,16 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/rogerlovato2/netflow-agent/internal/filter"
+	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 	"io"
 	"log/slog"
+	"math/rand/v2"
 	"net/http"
 	"net/netip"
 	"os"
@@ -18,8 +20,8 @@ import (
 	"time"
 
 	"github.com/rogerlovato2/netflow-agent/internal/engine"
+	"github.com/rogerlovato2/netflow-agent/internal/filter"
 	"github.com/rogerlovato2/netflow-agent/internal/router"
-	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
 
 // mapEvery is how often an enrolled agent asks who else is in the mesh.
@@ -395,6 +397,9 @@ func followTheMap(ctx context.Context, eng *engine.Engine, cfg *Config, rt route
 	t := time.NewTicker(mapEvery)
 	defer t.Stop()
 
+	// Told when to look, as well as looking on a clock. See mapNudges.
+	nudges := mapNudges(ctx, cfg, log)
+
 	// Seeded from what was already applied, so an unchanged map after a restart
 	// is not announced as news.
 	last := mapFingerprint(cfg.Peers)
@@ -535,9 +540,105 @@ func followTheMap(ctx context.Context, eng *engine.Engine, cfg *Config, rt route
 		select {
 		case <-ctx.Done():
 			return
+		case <-nudges:
+			// The server said something changed. Looking now rather than at
+			// the next tick is the whole point of listening.
 		case <-t.C:
 		}
 	}
+}
+
+// mapNudges is a stream from the server saying when to fetch the map.
+//
+// What arrives is only ever "go and look" — never the map itself. The agent
+// already knows how to fetch and apply one and that path is tested; a second
+// implementation carrying the map over a stream would be a second thing to
+// disagree with the first.
+//
+// Which also makes losing this harmless. A missed nudge costs one poll
+// interval, not correctness, and the poll below carries on regardless: push
+// makes a change quick, poll makes it certain, and a broken stream must never
+// mean a blind machine.
+func mapNudges(ctx context.Context, cfg *Config, log *slog.Logger) <-chan struct{} {
+	out := make(chan struct{}, 1)
+	go func() {
+		defer close(out)
+		// Backoff, because the failure this must survive is the panel being
+		// down: a hundred machines redialling twice a second is a panel that
+		// stays down.
+		delay := time.Second
+		for ctx.Err() == nil {
+			err := streamNudges(ctx, cfg, out)
+			if ctx.Err() != nil {
+				return
+			}
+			log.Debug("watch: the stream ended", "err", err, "retry_in", delay)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(jitter(delay)):
+			}
+			delay = min(delay*2, mapEvery)
+			// A stream that lasted is evidence the panel is well, so the next
+			// failure should retry fast rather than inherit an old outage.
+			if err == nil {
+				delay = time.Second
+			}
+		}
+	}()
+	return out
+}
+
+// jitter spreads retries out. Ten machines that lost the panel at the same
+// instant must not come back at the same instant.
+func jitter(d time.Duration) time.Duration {
+	if d <= 0 {
+		return 0
+	}
+	return d/2 + time.Duration(rand.Int64N(int64(d)))
+}
+
+// streamNudges holds one connection open and turns every event into a nudge.
+func streamNudges(ctx context.Context, cfg *Config, out chan<- struct{}) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, cfg.Server+"/api/mesh/watch", nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+cfg.Token)
+	req.Header.Set("Accept", "text/event-stream")
+
+	// No timeout on this client. The whole point is a request that lasts, and
+	// the shared one would cut it off — which is a bug that looks like the
+	// panel being flaky.
+	resp, err := (&http.Client{}).Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("watch: %s", resp.Status)
+	}
+
+	// Read by line. Anything that is not a comment is a reason to look, which
+	// keeps this indifferent to what the server decides to put in an event.
+	sc := bufio.NewScanner(resp.Body)
+	sc.Buffer(make([]byte, 0, 4096), 64*1024)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" || strings.HasPrefix(line, ":") {
+			continue
+		}
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		select {
+		case out <- struct{}{}:
+		default:
+			// One is already waiting. A machine that has not looked yet does
+			// not need telling twice.
+		}
+	}
+	return sc.Err()
 }
 
 func fetchMap(ctx context.Context, cfg *Config) (networkMap, error) {
