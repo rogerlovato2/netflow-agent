@@ -535,6 +535,25 @@ const (
 	// right about how hard it tried.
 	giveUpAfter = 20 * time.Minute
 
+	// resetShare and restartShare are how much of the mesh must be in trouble
+	// before the two escalations are allowed to fire.
+	//
+	// Neither escalation is cheap and neither is aimed at one peer. Reconnecting
+	// the signalling interrupts every negotiation this machine has in flight;
+	// restarting drops every tunnel it holds and renegotiates them all, which
+	// is a fresh race per pair and a fresh chance for each to settle on the
+	// relay. Doing that because one machine is switched off is worse than doing
+	// nothing, and it was: fifteen restarts in three hours, on a mesh whose
+	// only real fault was a shop with no route to the office.
+	//
+	// Half is the line for reconnecting, because a fault in this machine's own
+	// signalling shows up as most of its peers going quiet at once and nothing
+	// else does. Four fifths for restarting, because that is the shape of "this
+	// process is wrong about the world" rather than "the world has some holes
+	// in it".
+	resetShare   = 0.5
+	restartShare = 0.8
+
 	// restartEvery is the floor between self-restarts. A restart costs every
 	// working tunnel a few seconds, so a machine whose peer is simply switched
 	// off must not spend its life bouncing: at worst it restarts once an hour,
@@ -609,7 +628,33 @@ func (e *Engine) watchdog(ctx context.Context) {
 			}
 		}
 
-		if worst < stuckAfter {
+		// How much of the mesh is in trouble, not merely whether any of it is.
+		//
+		// This distinction was learned expensively. Measuring only the worst
+		// peer means one machine that is legitimately unreachable — a shop with
+		// no route, a laptop that is asleep, a server somebody switched off —
+		// makes `worst` climb without bound, and every escalation below fires
+		// on a mesh that is otherwise perfectly healthy. On one machine that
+		// was fifteen self-restarts in three hours, each one renegotiating
+		// every tunnel it had and losing some of them to the relay on the way
+		// back. The cure was worse than the fault.
+		//
+		// A peer that is down is ordinary. Most of them being down is not.
+		stuck := 0
+		for key, connected := range states {
+			if connected {
+				continue
+			}
+			if since, seen := lastGood[key]; seen && now.Sub(since) >= stuckAfter {
+				stuck++
+			}
+		}
+		share := 0.0
+		if len(states) > 0 {
+			share = float64(stuck) / float64(len(states))
+		}
+
+		if worst < stuckAfter || share < resetShare {
 			continue
 		}
 		if !lastReset.IsZero() && now.Sub(lastReset) < resetEvery {
@@ -621,18 +666,20 @@ func (e *Engine) watchdog(ctx context.Context) {
 		e.mu.Lock()
 		giveUp := e.giveUp
 		e.mu.Unlock()
-		if worst > giveUpAfter && giveUp != nil {
+		if worst > giveUpAfter && share >= restartShare && giveUp != nil {
 			if lastRestart.IsZero() || now.Sub(lastRestart) > restartEvery {
-				e.log.Warn("engine: a peer has been unreachable for far too long; restarting",
-					"peer", short(mustKey(worstPeer)), "for", worst.Round(time.Second))
+				e.log.Warn("engine: almost nothing is reachable and reconnecting did not help; restarting",
+					"peer", short(mustKey(worstPeer)), "for", worst.Round(time.Second),
+					"stuck", stuck, "of", len(states))
 				lastRestart = now
 				giveUp()
 				return
 			}
 		}
 
-		e.log.Warn("engine: a peer has been unreachable for a while; reconnecting the signalling",
-			"peer", short(mustKey(worstPeer)), "for", worst.Round(time.Second))
+		e.log.Warn("engine: much of the mesh is unreachable; reconnecting the signalling",
+			"peer", short(mustKey(worstPeer)), "for", worst.Round(time.Second),
+			"stuck", stuck, "of", len(states))
 		e.sig.Reset()
 		// And cut short whatever backoff every stuck peer is sitting in. The
 		// reconnect is only worth anything if somebody tries again after it,

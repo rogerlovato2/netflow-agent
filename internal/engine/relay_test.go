@@ -169,3 +169,52 @@ func TestCarryingReadsTheHandshakeAndNotTheHope(t *testing.T) {
 		t.Fatal("a tunnel with no handshake for nine hours was called healthy; this is the outage")
 	}
 }
+
+// The escalations must not fire because one machine is switched off.
+//
+// This is the regression that cost an afternoon. Once the watchdog started
+// measuring handshakes instead of ICE state it began seeing the truth, and the
+// truth in any real mesh includes a shop with no route and a laptop that is
+// asleep. Measuring only the worst peer, that truth reads as a permanent
+// emergency: fifteen self-restarts in three hours, each renegotiating every
+// tunnel and losing several to the relay on the way back.
+func TestEscalationNeedsMostOfTheMeshNotOnePeer(t *testing.T) {
+	// One peer down out of eighteen is an ordinary Tuesday.
+	if share(1, 18) >= resetShare {
+		t.Fatalf("one peer down out of eighteen (%.2f) reconnects the signalling", share(1, 18))
+	}
+	if share(1, 18) >= restartShare {
+		t.Fatal("one peer down out of eighteen restarts the whole agent")
+	}
+	// A laptop and two closed shops, still ordinary.
+	if share(3, 18) >= resetShare {
+		t.Fatalf("three peers down out of eighteen (%.2f) reconnects the signalling", share(3, 18))
+	}
+
+	// Half the mesh gone is this machine's problem, not the mesh's.
+	if share(9, 18) < resetShare {
+		t.Fatal("half the mesh unreachable does not even reconnect the signalling")
+	}
+	// And almost all of it gone is the case where starting over has always
+	// helped.
+	if share(15, 18) < restartShare {
+		t.Fatal("fifteen of eighteen unreachable is not enough to restart")
+	}
+	if share(9, 18) >= restartShare {
+		t.Fatal("half the mesh unreachable restarts the agent, before reconnecting has been given a chance")
+	}
+
+	// A mesh of one peer must not be a permanent emergency either: the share is
+	// 1.0 the moment that peer blinks, which is why the time thresholds still
+	// guard everything above this.
+	if share(0, 0) != 0 {
+		t.Fatal("a mesh with no peers reports trouble")
+	}
+}
+
+func share(stuck, total int) float64 {
+	if total == 0 {
+		return 0
+	}
+	return float64(stuck) / float64(total)
+}
