@@ -21,10 +21,36 @@ const (
 	maxFrame = 8 << 10
 
 	// sendQueue is how many envelopes may be waiting for one peer's socket.
-	// Negotiation is bursty — a peer trickles every candidate it finds within a
-	// second or two — so the queue has to absorb a burst without turning into a
-	// place where envelopes go stale.
-	sendQueue = 64
+	//
+	// Negotiation is bursty in a way that scales with the mesh, and sixty-four
+	// was sized against a pair rather than a fleet. Every peer that renegotiates
+	// sends one offer and then trickles each candidate it finds, so a machine
+	// in a mesh of eighteen receives on the order of a hundred and seventy
+	// envelopes inside a second or two whenever the mesh comes back together —
+	// after an update, after a signalling reset, after anything that makes
+	// everyone try at once.
+	//
+	// Sixty-four overflowed on every one of those, and overflow closed the
+	// socket. The peer reconnected within a second, and for that second every
+	// machine negotiating with it was told it was offline. Those negotiations
+	// failed, retried, and made the next burst larger. It is the whole of the
+	// instability: sockets flapping all day, pairs stuck in negotiation for
+	// hours, and a mesh that only recovered when somebody reconnected it by
+	// hand.
+	//
+	// A thousand is a burst from sixty peers, and costs about three hundred
+	// kilobytes per connection at the size an envelope actually is.
+	sendQueue = 1024
+
+	// enqueueWait is how long a full queue is given to drain before the peer is
+	// treated as one that cannot keep up.
+	//
+	// The write loop drains as fast as the socket accepts, and a full burst is
+	// tens of kilobytes — milliseconds on any link that works at all. So a
+	// queue that is still full after this long is not a burst, it is a peer
+	// that has stopped reading, and closing is right. Two seconds is far past
+	// the first and far short of anything a person would notice.
+	enqueueWait = 2 * time.Second
 
 	// writeWait bounds a single write. Without it one peer on a dead TCP
 	// connection parks a goroutine until the kernel gives up, which can be
@@ -215,15 +241,34 @@ func (s *Server) route(e Envelope) {
 	dst.enqueue(e)
 }
 
+// enqueue hands an envelope to a peer's write loop.
+//
+// Dropping one is not an option: a missing candidate looks exactly like a NAT
+// problem from the other end, and the negotiation it belonged to fails in a way
+// nothing in the logs explains. So the choice is between waiting and closing,
+// and closing used to be immediate — which turned every burst into a
+// disconnection, and every disconnection into a round of failed negotiations
+// that produced the next burst.
+//
+// Now it waits first. The write loop drains at socket speed, so a queue that
+// clears at all clears in milliseconds; one that is still full after
+// enqueueWait belongs to a peer that has stopped reading, and that peer is
+// better off closed and reconnecting.
 func (c *conn) enqueue(e Envelope) {
 	select {
 	case c.send <- e:
+		return
 	case <-c.closed:
+		return
 	default:
-		// A full queue means the peer is not draining its socket. Dropping one
-		// envelope would corrupt a negotiation in a way that is hard to debug —
-		// a missing candidate looks like a NAT problem — so the connection goes
-		// instead, and the peer reconnects into a clean session.
+	}
+
+	t := time.NewTimer(enqueueWait)
+	defer t.Stop()
+	select {
+	case c.send <- e:
+	case <-c.closed:
+	case <-t.C:
 		c.close()
 	}
 }
@@ -276,7 +321,13 @@ func (c *conn) pingLoop(ctx context.Context) {
 func (c *conn) close() {
 	c.closeOnce.Do(func() {
 		close(c.closed)
-		_ = c.ws.Close(websocket.StatusNormalClosure, "")
+		// Guarded because close is reached from several paths and one of them
+		// is reachable before the socket exists — and a nil dereference here
+		// would take the whole signalling server down with it, which is the one
+		// process every machine in the mesh depends on.
+		if c.ws != nil {
+			_ = c.ws.Close(websocket.StatusNormalClosure, "")
+		}
 	})
 }
 
