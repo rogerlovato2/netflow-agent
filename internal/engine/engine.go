@@ -162,6 +162,10 @@ type Engine struct {
 	// will, which is the right answer for a test and for an engine somebody
 	// embedded: exiting is a decision for the program, not for a library.
 	giveUp func()
+
+	// peerCtx is the context the peer goroutines were started under, kept so
+	// that one link can be rebuilt without waiting for the server to send a map.
+	peerCtx context.Context
 }
 
 // peerLink is everything the engine holds for one peer.
@@ -343,11 +347,82 @@ func (e *Engine) SetPeers(ctx context.Context, peers []Peer) {
 		e.readdress(m.prev, m.next)
 	}
 
+	// Kept so that a single link can be rebuilt later without waiting for the
+	// server to send a map. See rebuildPeer.
+	e.mu.Lock()
+	e.peerCtx = ctx
+	e.mu.Unlock()
+
 	for _, link := range starting {
 		lctx, cancel := context.WithCancel(ctx)
 		link.cancel = cancel
 		go e.keepPeerConnected(lctx, link)
 	}
+}
+
+// rebuildPeer tears one peer's link down to nothing and starts it again.
+//
+// It exists because there is no other way back from a link that has stopped
+// working on itself, and there was no way to notice one either. SetPeers is a
+// reconcile against what the server says the mesh contains, so a peer that is
+// already in the map is skipped — correctly, it is already being worked on —
+// and nothing anywhere asked whether the goroutine doing that work was still
+// alive and making attempts. One that stops leaves a link in the map that is
+// never retried, never logged and never repaired: on one machine a pair sat
+// like that for four hours, both ends agreeing it was down, neither making a
+// single attempt in forty-five minutes.
+//
+// This is the per-peer form of what an operator does by hand when they press
+// "reconnect everything", and it is deliberately not that: rebuilding one pair
+// costs that pair a few seconds, while rebuilding the mesh costs every pair at
+// once and re-runs every race, which is how a machine can come back from a
+// restart with more relayed tunnels than it had before.
+func (e *Engine) rebuildPeer(key string) bool {
+	e.mu.Lock()
+	link, ok := e.peers[key]
+	ctx := e.peerCtx
+	e.mu.Unlock()
+	if !ok || ctx == nil || ctx.Err() != nil {
+		return false
+	}
+
+	// End whatever the old goroutine is doing, and wait for it to actually be
+	// gone. Without the wait, two goroutines would negotiate the same peer at
+	// once and each would abandon the other's attempt for ever.
+	if link.cancel != nil {
+		link.cancel()
+	}
+	select {
+	case <-link.done:
+	case <-time.After(rebuildWait):
+		// It did not stop. Starting a second one anyway would be worse than
+		// leaving this peer broken until the next round.
+		e.log.Warn("engine: a peer's link would not stop; leaving it alone",
+			"peer", short(mustKey(key)))
+		return false
+	}
+
+	e.mu.Lock()
+	spec := link.spec
+	fresh := &peerLink{
+		spec:  spec,
+		done:  make(chan struct{}),
+		wake:  make(chan struct{}, 1),
+		state: p2p.StateIdle,
+	}
+	// Only if nothing else has replaced it in the meantime — a map update that
+	// arrived while this was waiting owns the link now.
+	if cur, still := e.peers[key]; !still || cur != link {
+		e.mu.Unlock()
+		return false
+	}
+	e.peers[key] = fresh
+	e.mu.Unlock()
+
+	lctx, cancel := context.WithCancel(ctx)
+	fresh.cancel = cancel
+	go e.keepPeerConnected(lctx, fresh)
+	return true
 }
 
 // readdressing is a peer that stayed but is now somewhere else.
@@ -535,6 +610,26 @@ const (
 	// right about how hard it tried.
 	giveUpAfter = 20 * time.Minute
 
+	// rebuildAfter is how long one peer may be failing before its link is torn
+	// down and built again from nothing.
+	//
+	// Between retrying and restarting the whole process there was nothing, and
+	// the gap is where the worst failures lived: a link whose own retry loop has
+	// stopped making attempts is invisible to everything else. It is still in
+	// the map, so the reconcile skips it; it reports a state, so the panel shows
+	// it; and it never logs, because nothing is happening. Four hours, both ends
+	// agreeing the pair was down, not one attempt between them.
+	//
+	// Five minutes is long enough that ordinary retrying — which backs off to
+	// fifteen seconds — has had twenty tries first.
+	rebuildAfter = 5 * time.Minute
+
+	// rebuildWait is how long the old goroutine is given to stop before the
+	// rebuild is abandoned. Two goroutines negotiating the same peer would
+	// abandon each other's attempts for ever, which is worse than one that is
+	// stuck.
+	rebuildWait = 20 * time.Second
+
 	// resetShare and restartShare are how much of the mesh must be in trouble
 	// before the two escalations are allowed to fire.
 	//
@@ -593,6 +688,9 @@ func (e *Engine) watchdog(ctx context.Context) {
 	// counts from the moment it was first noticed, not from zero: a machine
 	// that just started has not failed at anything yet.
 	lastGood := map[string]time.Time{}
+	// When each peer's link was last rebuilt, so a pair that cannot connect at
+	// all is not rebuilt every thirty seconds for ever.
+	lastRebuild := map[string]time.Time{}
 	var lastReset, lastRestart time.Time
 
 	for {
@@ -627,6 +725,11 @@ func (e *Engine) watchdog(ctx context.Context) {
 				delete(lastGood, key)
 			}
 		}
+		for key := range lastRebuild {
+			if _, ok := states[key]; !ok {
+				delete(lastRebuild, key)
+			}
+		}
 
 		// How much of the mesh is in trouble, not merely whether any of it is.
 		//
@@ -652,6 +755,23 @@ func (e *Engine) watchdog(ctx context.Context) {
 		share := 0.0
 		if len(states) > 0 {
 			share = float64(stuck) / float64(len(states))
+		}
+
+		// One peer at a time, and before anything that costs the whole machine:
+		// a link that has stopped working on itself is repaired by rebuilding
+		// that link, not by reconnecting every negotiation this agent has or by
+		// replacing the process.
+		if worst > rebuildAfter && worstPeer != "" {
+			if last, seen := lastRebuild[worstPeer]; !seen || now.Sub(last) > rebuildAfter {
+				lastRebuild[worstPeer] = now
+				e.log.Warn("engine: a peer has been down long enough to rebuild its link",
+					"peer", short(mustKey(worstPeer)), "for", worst.Round(time.Second))
+				if e.rebuildPeer(worstPeer) {
+					// Give the new link its own chance before judging the mesh
+					// on a number this one produced.
+					continue
+				}
+			}
 		}
 
 		if worst < stuckAfter || share < resetShare {
