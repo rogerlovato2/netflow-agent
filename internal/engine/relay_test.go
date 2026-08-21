@@ -129,3 +129,43 @@ func TestARetiredPeerIsForgotten(t *testing.T) {
 		t.Fatal("a peer that is gone is still being watched")
 	}
 }
+
+// What the watchdog decides a peer is doing, from its last handshake.
+//
+// This is the judgement that cost seven hours. The watchdog asked ICE whether a
+// peer was connected; a flapping signalling session let a negotiation through
+// now and then, ICE said connected for a moment, and that moment reset the
+// clock the watchdog was counting on. Meanwhile the tunnel had not completed a
+// handshake since the night before.
+func TestCarryingReadsTheHandshakeAndNotTheHope(t *testing.T) {
+	now := int64(1_000_000)
+	stale := int64(handshakeStale / time.Second)
+
+	// A peer the device has never heard of is mid-setup, not in trouble.
+	if !carrying(false, 0, now) {
+		t.Fatal("a peer the device does not know yet was called dead")
+	}
+
+	// A negotiated path that has never completed a handshake is not carrying,
+	// whatever ICE says about it.
+	if carrying(true, 0, now) {
+		t.Fatal("a path with no handshake at all was called healthy")
+	}
+
+	// Fresh.
+	if !carrying(true, now-1, now) {
+		t.Fatal("a handshake from a second ago was called stale")
+	}
+	if !carrying(true, now-stale+1, now) {
+		t.Fatal("a handshake just inside the window was called stale")
+	}
+
+	// And the case that matters: a tunnel that has been silent for hours while
+	// ICE still calls itself connected.
+	if carrying(true, now-stale-1, now) {
+		t.Fatal("a handshake past the window was still called healthy")
+	}
+	if carrying(true, now-9*3600, now) {
+		t.Fatal("a tunnel with no handshake for nine hours was called healthy; this is the outage")
+	}
+}

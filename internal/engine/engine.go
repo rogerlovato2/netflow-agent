@@ -494,6 +494,24 @@ const (
 	// the engine already keeps.
 	watchdogEvery = 30 * time.Second
 
+	// handshakeStale is how old a WireGuard handshake may get before the tunnel
+	// is treated as dead, whatever ICE believes about it.
+	//
+	// This exists because the watchdog was measuring the wrong thing and lost
+	// seven hours to it. It asked ICE whether the peer was connected; ICE said
+	// yes for a moment every time a flapping signalling session let a
+	// negotiation through, and that moment reset the watchdog's clock. The
+	// tunnel carried nothing for nine hours while the one number that said so —
+	// the age of the last handshake — was never read.
+	//
+	// Three minutes is chosen against WireGuard's own behaviour rather than
+	// picked: every peer is configured with a 25-second keepalive, so there is
+	// always something to send, and a peer with something to send rehandshakes
+	// every two minutes. A handshake older than three minutes on a tunnel that
+	// is supposed to be carrying keepalives is not a quiet link. It is a dead
+	// one.
+	handshakeStale = 3 * time.Minute
+
 	// stuckAfter is how long a peer must have been unreachable before the
 	// signalling is suspected. Long enough that an ordinary renegotiation, a
 	// reboot at the other end, or a minute of bad network is not it.
@@ -819,7 +837,17 @@ func (e *Engine) escapeRelay(ctx context.Context) {
 	}
 }
 
-// peerStates is every peer and whether it is connected right now.
+// peerStates is every peer and whether its tunnel is actually carrying.
+//
+// Two questions, and it took an outage to learn that only asking the first is
+// worthless. ICE says whether a path was negotiated; WireGuard's last handshake
+// says whether anything crosses it. A pair can hold the first for hours without
+// the second — the signalling flaps, a negotiation squeaks through, ICE reports
+// connected, and nothing has moved since last night.
+//
+// So a peer counts as healthy only if ICE has a path AND the handshake over it
+// is recent. Reading the device costs one call per tick for the whole set,
+// which is why it is done once here rather than per peer.
 func (e *Engine) peerStates() map[string]bool {
 	e.mu.Lock()
 	links := make(map[string]*peerLink, len(e.peers))
@@ -828,13 +856,49 @@ func (e *Engine) peerStates() map[string]bool {
 	}
 	e.mu.Unlock()
 
+	// Best effort. If the device cannot be read, fall back to what ICE thinks,
+	// which is what this did before and is better than calling everything dead.
+	var wg map[string]tunnel.PeerStatus
+	if st, err := e.dev.Status(); err == nil {
+		wg = st
+	}
+
+	now := time.Now().Unix()
 	out := make(map[string]bool, len(links))
 	for key, l := range links {
 		l.mu.Lock()
-		out[key] = l.state == p2p.StateConnected
+		connected := l.state == p2p.StateConnected
 		l.mu.Unlock()
+		if !connected || wg == nil {
+			out[key] = connected
+			continue
+		}
+		st, known := wg[key]
+		out[key] = carrying(known, st.LastHandshake, now)
 	}
 	return out
+}
+
+// carrying decides whether a peer with a negotiated path is actually moving
+// traffic, from the age of its last WireGuard handshake.
+//
+// Its own function because the whole outage turned on this one judgement and
+// it is three lines that are easy to get subtly wrong in either direction: too
+// eager and the watchdog tears down peers that have only just come up, too lax
+// and it sits through a nine-hour silence.
+func carrying(known bool, lastHandshake, now int64) bool {
+	// ICE has a path the device has never heard of: a peer mid-setup, not a
+	// peer in trouble.
+	if !known {
+		return true
+	}
+	// A path with no handshake at all yet. Not carrying, honestly — and the
+	// watchdog needs minutes of this before it acts, so a peer that has just
+	// connected is given time rather than disturbed.
+	if lastHandshake == 0 {
+		return false
+	}
+	return now-lastHandshake < int64(handshakeStale/time.Second)
 }
 
 // mustKey is for logging a key this engine already holds. A key that does not

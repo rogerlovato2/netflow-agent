@@ -176,7 +176,18 @@ func (c *Client) Run(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
-		c.log.Debug("signal: session ended, reconnecting", "err", err, "in", delay)
+		// At info, and this is the whole reason: a session that drops and comes
+		// back in under a second leaves no trace anybody looks at, and an agent
+		// doing it every quarter of an hour looks perfectly healthy from the
+		// outside. It is not healthy — every peer that tries to negotiate
+		// during one of those gaps is told this machine is offline, and a pair
+		// that lands in enough of them stays down for hours.
+		//
+		// Thirty of these went unexplained in one day because the line that
+		// would have explained them was invisible. Reconnecting is normal;
+		// reconnecting constantly is a fault, and the difference is only
+		// legible if the reconnections are written down.
+		c.log.Info("signal: session ended, reconnecting", "err", err, "in", delay)
 
 		select {
 		case <-ctx.Done():
@@ -311,7 +322,7 @@ func (c *Client) pingLoop(ctx context.Context, ws *websocket.Conn) error {
 			err := ws.Ping(pctx)
 			cancel()
 			if err != nil {
-				c.log.Debug("signal: no pong, treating the path as dead", "err", err)
+				c.log.Info("signal: no pong within the wait; the path is gone", "err", err)
 				return err
 			}
 		}
